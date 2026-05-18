@@ -330,3 +330,40 @@ Skills and tools in this repository are provided under MIT license.
 - OLK-6.6 Repository: openEuler Linux Kernel 6.6
 - Kernel Documentation: Documentation/process/coding-style.rst
 - QEMU Documentation: https://www.qemu.org/docs/
+## Verification Results
+
+### ARM64 End-to-End Test ✅
+
+| Item | Result | Details |
+|------|--------|---------|
+| Kernel | ✅ Pass | Image (37M), 6.6.0+ |
+| jffs2.ko | ✅ Pass | Module load successful |
+| MTD | ✅ Pass | mtd.ko + jffs2.ko loaded |
+| QEMU Boot | ✅ Pass | Shell entered |
+
+**Test Date**: 2026-05-18
+**Report**: docs/E2E_VERIFICATION_REPORT.md
+
+### ARM32 End-to-End Test ✅
+
+| Item | Result | Details |
+|------|--------|---------|
+| Kernel | ✅ Pass | zImage (11M), 6.6.0+ |
+| jffs2.ko | ✅ Pass | Module load successful (149K) |
+| MTD | ✅ Pass | Built-in (CONFIG_MTD=y) |
+| QEMU Boot | ✅ Pass | Shell entered |
+
+**Key Difference**: ARM32 MTD is built-in, no need for mtd.ko module.
+**Test Date**: 2026-05-18
+**Report**: docs/ARM32_E2E_REPORT.md
+
+### Architecture Comparison
+
+| Feature | ARM64 | ARM32 |
+|---------|-------|-------|
+| Kernel Image | Image (37M) | zImage (11M) |
+| jffs2.ko Size | 5.9M | 149K |
+| MTD Config | Module (m) | Built-in (y) |
+| Busybox Size | 969K | 2.1M |
+| Toolchain | aarch64-linux-gnu- | arm-linux-gnueabi- |
+
