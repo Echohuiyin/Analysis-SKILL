@@ -99,6 +99,114 @@ sudo apt install gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi  # ARM32
 sudo apt install qemu-system-arm qemu-system-x86
 ```
 
+### Busybox Installation (Critical for QEMU Testing)
+
+The qemu-test skill requires busybox to create minimal initramfs. **For cross-architecture testing, you need architecture-matched busybox.**
+
+#### Native Architecture (Simple Install)
+
+For same-architecture testing (e.g., x86_64 host → x86_64 QEMU):
+
+```bash
+# Ubuntu/Debian
+sudo apt install busybox-static
+
+# CentOS/RHEL
+sudo yum install busybox
+
+# Verify static linking
+ldd /bin/busybox
+# Expected: "not a dynamic executable" (static)
+```
+
+#### Cross-Architecture Busybox Compilation
+
+For cross-architecture testing (e.g., x86_64 host → ARM64/ARM32 QEMU), compile busybox for target architecture:
+
+**Prerequisites**:
+```bash
+# Download busybox source
+wget https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+tar -xjf busybox-1.36.1.tar.bz2
+cd busybox-1.36.1
+```
+
+**ARM64 Busybox**:
+```bash
+# Configure for ARM64
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+
+# Enable static compilation
+sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+
+# Build
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+
+# Result: busybox (ARM64 static, ~969K)
+file busybox
+# Expected: ELF 64-bit LSB executable, ARM aarch64, version 1 (GNU/Linux), statically linked
+```
+
+**ARM32 Busybox**:
+```bash
+# Configure for ARM32
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- defconfig
+
+# Enable static compilation
+sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+
+# Build
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- -j$(nproc)
+
+# Result: busybox (ARM32 static, ~900K)
+file busybox
+# Expected: ELF 32-bit LSB executable, ARM, version 1 (GNU/Linux), statically linked
+```
+
+**Installation for QEMU Testing**:
+```bash
+# Create directory for cross-arch busybox
+mkdir -p ~/.local/share/qemu-busybox
+
+# Copy compiled busybox
+cp busybox ~/.local/share/qemu-busybox/busybox-arm64  # For ARM64
+cp busybox ~/.local/share/qemu-busybox/busybox-arm32  # For ARM32
+
+# Update create_initramfs.sh or use custom busybox path
+# Option 1: Set BUSYBOX_PATH environment variable
+export BUSYBOX_PATH=~/.local/share/qemu-busybox/busybox-arm64
+
+# Option 2: Modify create_initramfs.sh to detect architecture
+```
+
+#### Architecture Compatibility Matrix
+
+| Host Arch | QEMU Arch | Busybox Required | Size |
+|-----------|-----------|------------------|------|
+| x86_64 | x86_64 | x86_64 (native) | ~1.0M |
+| x86_64 | ARM64 | ARM64 (cross-compile) | ~969K |
+| x86_64 | ARM32 | ARM32 (cross-compile) | ~900K |
+| ARM64 | ARM64 | ARM64 (native) | ~969K |
+| ARM32 | ARM32 | ARM32 (native) | ~900K |
+
+#### Common Busybox Issues
+
+**Problem**: x86-64 busybox in ARM64 QEMU
+```
+/modules/jffs2.ko: line 1: ELF...: not found
+insmod: can't insert '/modules/jffs2.ko': exec format error
+```
+
+**Solution**: Compile ARM64 static busybox (see above).
+
+**Problem**: Dynamic-linked busybox missing libraries
+```
+/bin/sh: No such file or directory
+init: exec failed: /bin/sh
+```
+
+**Solution**: Use static-linked busybox (`CONFIG_STATIC=y`).
+
 ### Installing Skills
 
 Copy skill directories to Claude Code skills directory:
