@@ -73,13 +73,94 @@ If kernel image exists, use it directly. If not:
 
 ### Step 2: Create Minimal Initramfs
 
+**CRITICAL: Busybox Architecture Matching**
+
+Before creating initramfs, verify busybox architecture matches QEMU target:
+
+```bash
+# Detect host architecture
+HOST_ARCH=$(uname -m)  # e.g., x86_64
+
+# Determine target architecture
+TARGET_ARCH="$ARCH"    # arm64, arm32, x86_64
+
+# Architecture compatibility matrix
+if [ "$HOST_ARCH" != "$TARGET_ARCH" ] && [ "$TARGET_ARCH" != "x86_64" ]; then
+    # Cross-architecture testing requires cross-compiled busybox
+    BUSYBOX_REQUIRED="cross-compiled"
+fi
+```
+
+**Busybox Architecture Detection**:
+```bash
+# Check busybox architecture
+BUSYBOX_PATH="/usr/bin/busybox"  # or custom path
+BUSYBOX_ARCH=$(file "$BUSYBOX_PATH" | grep -oE "x86-64|ARM aarch64|ARM,")
+
+# Verify match
+if [ "$TARGET_ARCH" = "arm64" ] && [ "$BUSYBOX_ARCH" != "ARM aarch64" ]; then
+    echo "ERROR: x86-64 busybox cannot run in ARM64 QEMU"
+    echo "Solution: Cross-compile ARM64 busybox (see Busybox section below)"
+    exit 1
+fi
+```
+
+**Required Busybox Applets Checklist**:
+
+Create initramfs with these minimum applets enabled:
+
+| Category | Required Applets | Purpose |
+|----------|-----------------|---------|
+| **Shell** | `sh`, `ash` | Script execution |
+| **Basic** | `cat`, `ls`, `echo`, `mkdir`, `sleep` | File operations |
+| **Mount** | `mount`, `umount` | Filesystem mounting |
+| **System** | `poweroff`, `reboot`, `dmesg` | System control |
+| **Modules** | `insmod`, `lsmod`, `rmmod` | Module loading |
+| **Info** | `uname`, `grep` | System info |
+| **Device** | `mknod` | Device node creation |
+| **Test** | `test`, `[` (same command) | Condition checks |
+| **Logs** | `tail`, `head` | Log viewing |
+| **Time** | `date` | Timestamps |
+
+**Common Busybox Issues & Solutions**:
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| `Failed to execute /init (error -8)` | Architecture mismatch | Cross-compile busybox for target arch |
+| `command: not found` | Applet not enabled | Add to busybox config |
+| `tail: invalid option` | Minimal tail config | Enable `CONFIG_FEATURE_TAIL_USE_F` |
+| `[: not found` | test/[ applet missing | Enable `CONFIG_TEST=y` |
+
 Read and execute `scripts/create_initramfs.sh`:
 
 Creates a minimal bootable initramfs with:
-- Busybox (static linked)
+- Busybox (static linked, **architecture-matched**)
 - Basic init script
 - Mounts: /proc, /sys, /dev
 - Test script embedding (if --script provided)
+
+**Busybox Cross-Compilation** (when host ≠ target):
+
+```bash
+# ARM64 Busybox (from x86_64 host)
+cd /tmp
+wget https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+tar xf busybox-1.36.1.tar.bz2 && cd busybox-1.36.1
+
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- allnoconfig
+
+# Enable required applets (see checklist above)
+scripts/config --enable CONFIG_STATIC --enable CONFIG_ASH --enable CONFIG_SH
+scripts/config --enable CONFIG_CAT CONFIG_LS CONFIG_MOUNT CONFIG_INSMOD
+scripts/config --enable CONFIG_TEST CONFIG_TAIL CONFIG_DATE CONFIG_DMESG
+scripts/config --enable CONFIG_POWEROFF CONFIG_REBOOT CONFIG_UNAME
+
+yes "" | make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- oldconfig
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+
+# Result: busybox (ARM64 static, ~1.1M)
+file busybox  # Verify: ELF 64-bit LSB executable, ARM aarch64, statically linked
+```
 
 ### Step 3: Prepare QEMU Command
 

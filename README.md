@@ -1,17 +1,143 @@
-# Kernel Build & QEMU Test Skills
+# Kernel Analysis Skills Collection
 
-This repository contains Claude Code skills for building and testing Linux kernels with QEMU virtualization.
+This repository contains Claude Code skills for kernel compilation, QEMU testing, and JFFS2 filesystem analysis.
 
 ## Overview
 
-Two complementary skills for kernel development workflow:
+Four independent and decoupled skills for kernel development workflow:
 
 - **kernel-build**: Compile Linux kernels with custom configurations
 - **qemu-test**: Boot kernels in QEMU for testing and verification
+- **jffs2-analyzer**: Static analysis of JFFS2 filesystem images
+- **jffs2-mount**: Mount JFFS2 images in QEMU for dynamic verification
+
+All skills are **completely decoupled** - each skill operates independently without calling or depending on other skills.
 
 ## Skills
 
-### kernel-build Skill
+### 1. kernel-build Skill
+
+**Location**: `skills/kernel-build/`
+
+Build the OLK-6.6 Linux kernel with custom CONFIG options.
+
+**Key Features**:
+- ARM64/ARM32/x86_64 architecture support
+- Native and cross-compilation
+- Automatic toolchain detection
+- openeuler_defconfig base configuration
+
+**Usage**:
+```
+/kernel-build <config-options> [--arch <arch>] [--cross] [--jobs <N>]
+```
+
+**Examples**:
+```
+/kernel-build CONFIG_JFFS2_FS=m --arch arm64 --cross
+/kernel-build UB XCU_SCHEDULER --arch x86_64 --jobs 32
+/kernel-build ARM64_MPAM --arch arm64 --cross --jobs 64
+```
+
+**Output**:
+- Kernel Image (arch/arm64/boot/Image, arch/x86/boot/bzImage)
+- Kernel Modules (*.ko files)
+
+**Important**: Kernel and modules must be compiled in the SAME build session to ensure version matching.
+
+### 2. qemu-test Skill
+
+**Location**: `skills/qemu-test/`
+
+Boot kernels in QEMU and run automated tests.
+
+**Key Features**:
+- Multi-architecture QEMU support (ARM64/ARM32/x86_64)
+- Minimal initramfs creation with busybox
+- Module loading tests
+- Automated test script execution
+
+**Usage**:
+```
+/qemu-test --arch arm64 --kernel <path> --modules <path> [--script <path>]
+```
+
+**Examples**:
+```
+/qemu-test --arch arm64 --interactive
+/qemu-test --script tests/jffs2_test.sh --timeout 60
+/qemu-test --kernel arch/x86/boot/bzImage --arch x86_64
+```
+
+**Decoupled**: This skill does NOT call kernel-build. It expects user to provide pre-compiled kernel.
+
+### 3. jffs2-analyzer Skill
+
+**Location**: `skills/jffs2-analyzer/`
+
+Static analysis of JFFS2 filesystem images without mounting.
+
+**Key Features**:
+- Parse JFFS2 node structures (dirent, inode, data)
+- Extract metadata and file information
+- Validate node checksums
+- No kernel or QEMU required
+
+**Usage**:
+```
+/jffs2-analyzer <jffs2-image> [--output <dir>] [--verbose]
+```
+
+**Examples**:
+```
+/jffs2-analyzer /path/to/jffs2.img
+/jffs2-analyzer test.jffs2 --output analysis_results
+```
+
+**Decoupled**: Standalone Python-based analysis, no dependencies on kernel-build or qemu-test.
+
+### 4. jffs2-mount Skill
+
+**Location**: `skills/jffs2-mount/`
+
+Mount JFFS2 filesystem images in QEMU for dynamic verification.
+
+**Key Features**:
+- Create JFFS2 test images (mkfs.jffs2 or blank)
+- Setup MTD device in QEMU
+- Load JFFS2 module and mount filesystem
+- Verify mount success and file access
+
+**Usage**:
+```
+/jffs2-mount --kernel <path> [--image <path>] [--size <MB>] [--mount-test]
+```
+
+**Examples**:
+```
+/jffs2-mount --kernel arch/arm64/boot/Image --mount-test
+/jffs2-mount --kernel Image --image custom.jffs2 --arch arm64
+/jffs2-mount --kernel bzImage --size 32 --content ./data
+```
+
+**Decoupled**: This skill is COMPLETELY INDEPENDENT from:
+- kernel-build (requires user-provided kernel)
+- qemu-test (has its own QEMU launch logic)
+- jffs2-analyzer (complementary - analyze first, then mount)
+
+**Workflow Integration**: Users can combine skills as needed:
+```
+# Option 1: Full workflow
+/kernel-build JFFS2_FS --arch arm64 --cross
+/jffs2-analyzer test.jffs2
+/jffs2-mount --kernel arch/arm64/boot/Image --image test.jffs2
+
+# Option 2: Each skill independently
+/kernel-build UB --arch x86_64           # Just build
+/qemu-test --arch arm64 --interactive    # Just boot
+/jffs2-analyzer image.jffs2              # Just analyze
+/jffs2-mount --kernel Image --mount-test # Just mount
+```
 
 Build the OLK-6.6 Linux kernel with custom CONFIG options.
 
@@ -209,40 +335,124 @@ init: exec failed: /bin/sh
 
 ### Installing Skills
 
-Copy skill directories to Claude Code skills directory:
+Copy all 4 skill directories to Claude Code skills directory:
 ```bash
 mkdir -p ~/.claude/skills
 cp -r skills/kernel-build ~/.claude/skills/
 cp -r skills/qemu-test ~/.claude/skills/
+cp -r skills/jffs2-analyzer ~/.claude/skills/
+cp -r skills/jffs2-mount ~/.claude/skills/
+```
+
+**Verification**:
+```bash
+ls ~/.claude/skills/
+# Expected: kernel-build qemu-test jffs2-analyzer jffs2-mount
 ```
 
 ## Directory Structure
 
 ```
 Analysis-SKILL/
-├── README.md                       # This file
+├── README.md                       # This file (updated 2026-05-18)
 ├── skills/
-│   ├── kernel-build/
+│   ├── kernel-build/               # Skill 1: Kernel compilation
 │   │   ├── SKILL.md                # Skill definition
 │   │   ├── OPTIMIZATION_SUMMARY.md # Build optimizations
 │   │   └── VALIDATION_REPORT.md    # Validation results
-│   └── qemu-test/
+│   ├── qemu-test/                  # Skill 2: QEMU boot testing
+│   │   ├── SKILL.md                # Skill definition
+│   │   ├── scripts/                # Helper scripts
+│   │   │   ├── create_initramfs.sh
+│   │   │   ├── boot_arm64.sh
+│   │   │   ├── boot_arm32.sh
+│   │   │   ├── boot_x86.sh
+│   │   │   └── run_test.sh
+│   │   └── references/
+│   │       └── arch_configs.md     # Architecture-specific configs
+│   ├── jffs2-analyzer/             # Skill 3: Static JFFS2 analysis
+│   │   ├── SKILL.md                # Skill definition
+│   │   ├── README.md               # Analyzer documentation
+│   │   ├── scripts/
+│   │   │   └── jffs2_parser.py     # Python parser implementation
+│   │   └── references/
+│   │       └── jffs2_structures.md # JFFS2 format reference
+│   └── jffs2-mount/                # Skill 4: JFFS2 mount testing
 │       ├── SKILL.md                # Skill definition
-│       ├── scripts/                # Helper scripts
-│       │   ├── create_initramfs.sh
-│       │   ├── boot_arm64.sh
-│       │   ├── boot_arm32.sh
-│       │   ├── boot_x86.sh
-│       │   └── run_test.sh
-│       └── references/
-│           └── arch_configs.md     # Architecture-specific configs
+│       └── scripts/
+│           ├── create_jffs2_image.sh    # JFFS2 image creation
+│           ├── create_initramfs.sh      # Initramfs for mount test
+│           ├── mount_test.sh            # Mount test execution
+│           └── run_qemu.sh              # QEMU launch script
 ├── docs/
 │   ├── E2E_VERIFICATION_REPORT.md  # End-to-end test report
 │   └── cross_arch_busybox_analysis.md  # Busybox cross-arch solution
 └── tools/                          # Additional utilities
 ```
 
+## Skill Architecture & Decoupling
+
+All 4 skills are **completely decoupled**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Independent Skills                         │
+├─────────────────────────────────────────────────────────────┤
+│  kernel-build    │ qemu-test      │ jffs2-analyzer │ jffs2-mount │
+│  ─────────────   │ ───────────    │ ─────────────  │ ─────────── │
+│  Compile kernel  │ Boot kernel    │ Static analysis│ Mount test │
+│  Output: Image   │ Requires: Image│ Input: jffs2   │ Requires:  │
+│  + modules       │ (user provides)│ Output: report │ Image+kernel│
+│                  │ Output: logs   │                │ (user prov) │
+│  No calls to:    │ No calls to:   │ No calls to:   │ No calls to:│
+│  other skills    │ kernel-build   │ other skills   │ other skills│
+└─────────────────────────────────────────────────────────────┘
+
+Users combine skills as needed:
+  Step 1: /kernel-build JFFS2_FS --arch arm64 (optional)
+  Step 2: /jffs2-analyzer image.jffs2          (independent)
+  Step 3: /jffs2-mount --kernel Image --mount  (independent)
+  Step 4: /qemu-test --kernel Image            (independent)
+```
+
 ## Key Technical Notes
+
+### Critical Lessons from Testing
+
+Based on ARM64 end-to-end verification (2026-05-18):
+
+| Lesson | Issue | Solution |
+|--------|-------|----------|
+| **Architecture Matching** | x86-64 busybox fails in ARM64 QEMU | Cross-compile busybox for target arch |
+| **Interactive Config** | `make defconfig` prompts hundreds of options | Use `make allnoconfig` + sed + `yes ""` |
+| **Applet Missing** | Scripts fail: `command not found` | Enable all required applets in busybox |
+| **Tail Options** | `tail -10` doesn't work | Enable `CONFIG_FEATURE_TAIL_USE_F` |
+| **Module Version** | Kernel/module mismatch fails | Compile kernel+modules in same session |
+| **MTD Dependency** | JFFS2 needs MTD device | Setup block2mtd/mtdram before mount |
+
+### Busybox Requirements for QEMU Testing
+
+**Minimum applets checklist** (based on real testing):
+
+| Category | Applets | Purpose |
+|----------|---------|---------|
+| Shell | `sh`, `ash`, `test`, `[` | Script execution |
+| Basic | `cat`, `ls`, `mkdir`, `sleep` | File operations |
+| Mount | `mount`, `umount`, `mknod` | Filesystem |
+| System | `poweroff`, `reboot`, `dmesg` | Control |
+| Modules | `insmod`, `lsmod`, `rmmod` | Kernel modules |
+| Info | `uname`, `grep`, `date` | Information |
+| Logs | `tail` (with features) | Log viewing |
+
+**Automated cross-compilation tool**: `tools/build_busybox.sh`
+
+```bash
+# Build ARM64 busybox with all required applets
+./tools/build_busybox.sh --arch arm64
+
+# Build with custom applets
+./tools/build_busybox.sh --arch arm64 --applets wget,curl,vi
+```
 
 ### Version Matching
 
