@@ -1,15 +1,16 @@
 # Kernel Analysis Skills Collection
 
-This repository contains Claude Code skills for kernel compilation, QEMU testing, and JFFS2 filesystem analysis.
+This repository contains Claude Code skills for kernel compilation, QEMU testing, JFFS2 filesystem analysis, and fault injection testing.
 
 ## Overview
 
-Four independent and decoupled skills for kernel development workflow:
+Five independent and decoupled skills for kernel development workflow:
 
 - **kernel-build**: Compile Linux kernels with custom configurations
 - **qemu-test**: Boot kernels in QEMU for testing and verification
 - **jffs2-analyzer**: Static analysis of JFFS2 filesystem images
 - **jffs2-mount**: Mount JFFS2 images in QEMU for dynamic verification
+- **jffs2-fault-inject**: Inject faults into JFFS2 images for testing
 
 All skills are **completely decoupled** - each skill operates independently without calling or depending on other skills.
 
@@ -104,7 +105,7 @@ Mount JFFS2 filesystem images in QEMU for dynamic verification.
 
 **Key Features**:
 - Create JFFS2 test images (mkfs.jffs2 or blank)
-- Setup MTD device in QEMU
+- Setup MTD device in QEMU (mtdram method recommended)
 - Load JFFS2 module and mount filesystem
 - Verify mount success and file access
 
@@ -120,22 +121,61 @@ Mount JFFS2 filesystem images in QEMU for dynamic verification.
 /jffs2-mount --kernel bzImage --size 32 --content ./data
 ```
 
+**Recommended**: Use mtdram instead of block2mtd to avoid loop device issues.
+
 **Decoupled**: This skill is COMPLETELY INDEPENDENT from:
 - kernel-build (requires user-provided kernel)
 - qemu-test (has its own QEMU launch logic)
 - jffs2-analyzer (complementary - analyze first, then mount)
 
+### 5. jffs2-fault-inject Skill
+
+**Location**: `skills/jffs2-fault-inject/`
+
+Inject various faults into JFFS2 filesystem images for testing kernel fault handling.
+
+**Key Features**:
+- Inject CRC errors (hdr_crc, node_crc, data_crc, name_crc)
+- Inject magic number corruption (0xDEAD)
+- Inject invalid node types
+- Generate fault injection report JSON
+- Compatible with jffs2-analyzer for validation
+
+**Usage**:
+```
+/jffs2-fault-inject --image <path> [--fault <type>] [--output <dir>]
+```
+
+**Fault Types**:
+- `hdr_crc`: Corrupt node header CRC
+- `node_crc`: Corrupt node structure CRC
+- `data_crc`: Corrupt data payload CRC
+- `name_crc`: Corrupt dirent name CRC
+- `magic`: Invalid magic number (0xDEAD)
+- `nodetype`: Invalid node type
+- `version_zero`: Zero version field
+
+**Examples**:
+```
+/jffs2-fault-inject --image normal.jffs2 --fault hdr_crc,node_crc,magic
+/jffs2-fault-inject --image test.jffs2 --fault all --output fault_output
+```
+
+**Decoupled**: Standalone Python-based fault injection, can be used before jffs2-analyzer or jffs2-mount.
+
 **Workflow Integration**: Users can combine skills as needed:
 ```
-# Option 1: Full workflow
+# Option 1: Full fault testing workflow
 /kernel-build JFFS2_FS --arch arm64 --cross
-/jffs2-analyzer test.jffs2
-/jffs2-mount --kernel arch/arm64/boot/Image --image test.jffs2
+/jffs2-fault-inject --image normal.jffs2 --fault hdr_crc,magic
+/jffs2-analyzer corrupted.jffs2
+/jffs2-mount --kernel arch/arm64/boot/Image --image corrupted.jffs2
 
 # Option 2: Each skill independently
 /kernel-build UB --arch x86_64           # Just build
 /qemu-test --arch arm64 --interactive    # Just boot
 /jffs2-analyzer image.jffs2              # Just analyze
+/jffs2-fault-inject --image test.jffs2   # Just inject faults
 /jffs2-mount --kernel Image --mount-test # Just mount
 ```
 
@@ -354,7 +394,7 @@ ls ~/.claude/skills/
 
 ```
 Analysis-SKILL/
-├── README.md                       # This file (updated 2026-05-18)
+├── README.md                       # This file (updated 2026-05-20)
 ├── skills/
 │   ├── kernel-build/               # Skill 1: Kernel compilation
 │   │   ├── SKILL.md                # Skill definition
@@ -377,42 +417,51 @@ Analysis-SKILL/
 │   │   │   └── jffs2_parser.py     # Python parser implementation
 │   │   └── references/
 │   │       └── jffs2_structures.md # JFFS2 format reference
-│   └── jffs2-mount/                # Skill 4: JFFS2 mount testing
+│   ├── jffs2-mount/                # Skill 4: JFFS2 mount testing
+│   │   ├── SKILL.md                # Skill definition (updated with mtdram)
+│   │   └── scripts/
+│   │       ├── create_jffs2_image.sh    # JFFS2 image creation
+│   │       ├── create_initramfs.sh      # Initramfs for mount test
+│   │       ├── mount_test.sh            # Mount test execution
+│   │       └── run_qemu.sh              # QEMU launch script
+│   └── jffs2-fault-inject/         # Skill 5: Fault injection
 │       ├── SKILL.md                # Skill definition
-│       └── scripts/
-│           ├── create_jffs2_image.sh    # JFFS2 image creation
-│           ├── create_initramfs.sh      # Initramfs for mount test
-│           ├── mount_test.sh            # Mount test execution
-│           └── run_qemu.sh              # QEMU launch script
+│       ├── README.md               # Fault injector documentation
+│       ├── scripts/
+│       │   └ jffs2_fault_injector.py  # Python injector implementation
+│       └── examples/
+│           └── fault_scenarios.json    # Example fault scenarios
 ├── docs/
 │   ├── E2E_VERIFICATION_REPORT.md  # End-to-end test report
+│   ├── TESTING_ISSUES_AND_SOLUTIONS.md  # Problem summary (2026-05-20)
 │   └── cross_arch_busybox_analysis.md  # Busybox cross-arch solution
 └── tools/                          # Additional utilities
 ```
 
 ## Skill Architecture & Decoupling
 
-All 4 skills are **completely decoupled**:
+All 5 skills are **completely decoupled**:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Independent Skills                         │
-├─────────────────────────────────────────────────────────────┤
-│  kernel-build    │ qemu-test      │ jffs2-analyzer │ jffs2-mount │
-│  ─────────────   │ ───────────    │ ─────────────  │ ─────────── │
-│  Compile kernel  │ Boot kernel    │ Static analysis│ Mount test │
-│  Output: Image   │ Requires: Image│ Input: jffs2   │ Requires:  │
-│  + modules       │ (user provides)│ Output: report │ Image+kernel│
-│                  │ Output: logs   │                │ (user prov) │
-│  No calls to:    │ No calls to:   │ No calls to:   │ No calls to:│
-│  other skills    │ kernel-build   │ other skills   │ other skills│
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Independent Skills                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│  kernel-build  │ qemu-test    │ jffs2-analyzer │ jffs2-mount │ jffs2-fault-inject │
+│  ────────────  │ ──────────   │ ─────────────  │ ──────────  │ ─────────────────  │
+│  Compile kernel│ Boot kernel  │ Static analysis│ Mount test  │ Inject faults      │
+│  Output: Image │ Requires:Img │ Input: jffs2   │ Requires:   │ Input: jffs2       │
+│  + modules     │ (user prov)  │ Output: report │ Image+kernel│ Output: corrupted  │
+│                │ Output: logs │                │ (user prov) │ jffs2 + report     │
+│  No calls to:  │ No calls to: │ No calls to:   │ No calls to:│ No calls to:       │
+│  other skills  │ kernel-build │ other skills   │ other skills│ other skills       │
+└─────────────────────────────────────────────────────────────────────────┘
 
 Users combine skills as needed:
   Step 1: /kernel-build JFFS2_FS --arch arm64 (optional)
-  Step 2: /jffs2-analyzer image.jffs2          (independent)
-  Step 3: /jffs2-mount --kernel Image --mount  (independent)
-  Step 4: /qemu-test --kernel Image            (independent)
+  Step 2: /jffs2-fault-inject --image test.jffs2 --fault hdr_crc,magic
+  Step 3: /jffs2-analyzer corrupted.jffs2          (independent)
+  Step 4: /jffs2-mount --kernel Image --mount      (independent)
+  Step 5: /qemu-test --kernel Image                (independent)
 ```
 
 ## Key Technical Notes

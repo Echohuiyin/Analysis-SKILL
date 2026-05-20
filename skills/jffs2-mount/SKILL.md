@@ -102,69 +102,82 @@ fi
 
 **MTD设备创建方法**：
 
-| 方法 | 适用场景 | 命令 |
-|------|---------|------|
-| **block2mtd** | 将块设备转换为MTD | `modprobe block2mtd block_device erase_size` |
-| **mtdram** | 虚拟RAM MTD设备 | `modprobe mtdram total_size erase_size` |
-| **mtdblock** | MTD块设备模拟 | 内置模块，创建/dev/mtdblock* |
+| 方法 | 适用场景 | 优点 | 缺点 |
+|------|---------|------|------|
+| **mtdram** (推荐) | 虚拟RAM MTD设备 | 无需loop设备，简单可靠 | 数据不持久 |
+| **block2mtd** | 将块设备转换为MTD | 可持久化存储 | 需loop设备支持，复杂 |
 
-**完整MTD配置流程**：
+**推荐使用mtdram方式**（避免block2mtd的loop设备依赖问题）：
 
 ```bash
-# 在initramfs中的MTD设备配置脚本
-cat > "$INITRAMFS_DIR/setup_mtd.sh" << 'EOF'
+# mtdram方式 - 简单可靠（推荐）
+# 1. 编译内核启用mtdram模块
+# CONFIG_MTD_MTDRAM=m
+
+# 2. 在initramfs中加载mtdram并写入镜像
+insmod /modules/mtdram.ko total_size=16384 erase_size=64
+dd if=/jffs2.img of=/dev/mtdblock0 bs=64K
+mount -t jffs2 /dev/mtdblock0 /mnt/jffs2
+```
+
+**完整MTD配置流程（mtdram方式）**：
+
+```bash
+# 在initramfs中的MTD设备配置脚本（推荐）
+cat > "$INITRAMFS_DIR/setup_mtd_mtdram.sh" << 'EOF'
 #!/bin/sh
 
-echo "=== MTD Device Setup ==="
+echo "=== MTD Device Setup (mtdram) ==="
 
-# Method 1: block2mtd (preferred for JFFS2 image files)
-# Requires: loop device + block2mtd module
-if [ -f /jffs2.img ] && [ -e /dev/loop0 ]; then
-    echo "Setting up block2mtd device..."
-    
-    # Load block2mtd module
-    insmod /modules/block2mtd.ko || {
-        echo "Failed to load block2mtd"
-        exit 1
-    }
-    
-    # Setup loop device for JFFS2 image
-    losetup /dev/loop0 /jffs2.img
-    
-    # Register block2mtd device
-    # erase_size = 64KB (0x10000) typical for JFFS2
-    echo "/dev/loop0,0x10000" > /sys/module/block2mtd/parameters/block2mtd
-    
-    # Wait for MTD device creation
-    sleep 1
-    
-    # Check MTD device
-    cat /proc/mtd
-    
-    echo "✓ block2mtd device created"
-fi
-
-# Method 2: mtdram (virtual RAM-based MTD)
-# Useful for testing without real storage
-if [ ! -e /dev/mtd0 ]; then
-    echo "Setting up mtdram device..."
-    
-    insmod /modules/mtdram.ko total_size=16384 erase_size=64 || {
-        echo "Failed to load mtdram"
-    }
-    
-    sleep 1
-    cat /proc/mtd
-fi
-
-# Verify MTD device exists
-if [ -e /dev/mtd0 ] || [ -e /dev/mtdblock0 ]; then
-    echo "✓ MTD device ready"
-else
-    echo "✗ No MTD device available"
-    echo "Cannot mount JFFS2 without MTD"
+# Load mtdram module
+# total_size=16384 (16MB), erase_size=64 (64KB block)
+insmod /modules/mtdram.ko total_size=16384 erase_size=64 || {
+    echo "Failed to load mtdram"
     exit 1
+}
+
+sleep 1
+
+# Check MTD device
+cat /proc/mtd
+echo "✓ mtdram device created (16MB RAM MTD)"
+
+# Write JFFS2 image to mtdblock device
+if [ -f /jffs2.img ]; then
+    dd if=/jffs2.img of=/dev/mtdblock0 bs=64K
+    echo "✓ JFFS2 image written to mtdblock0"
 fi
+EOF
+```
+
+**block2mtd方式（备选）**：
+
+```bash
+# block2mtd方式 - 需要loop设备支持（备选）
+# 注意：可能遇到losetup失败问题
+cat > "$INITRAMFS_DIR/setup_mtd_block2mtd.sh" << 'EOF'
+#!/bin/sh
+
+echo "=== MTD Device Setup (block2mtd) ==="
+
+# Load block2mtd module
+insmod /modules/block2mtd.ko || {
+    echo "Failed to load block2mtd"
+    exit 1
+}
+
+# Setup loop device (requires losetup applet)
+losetup /dev/loop0 /jffs2.img || {
+    echo "Failed to setup loop device"
+    echo "Solution: Use mtdram instead"
+    exit 1
+}
+
+# Register block2mtd device
+echo "/dev/loop0,65536" > /sys/module/block2mtd/parameters/block2mtd_devices
+
+sleep 1
+cat /proc/mtd
 EOF
 ```
 
@@ -190,11 +203,11 @@ mount -t jffs2 mtd0 /mnt/jffs2
 **关键经验：模块加载 ≠ 功能可用，需配套MTD设备配置**
 
 ```bash
-# 完整的JFFS2挂载测试脚本
+# 完整的JFFS2挂载测试脚本（推荐mtdram方式）
 cat > "$INITRAMFS_DIR/jffs2_mount_test.sh" << 'EOF'
 #!/bin/sh
 
-echo "=== JFFS2 Complete Mount Test ==="
+echo "=== JFFS2 Complete Mount Test (mtdram) ==="
 echo "Date: $(date)"
 echo "Kernel: $(uname -r)"
 
@@ -203,29 +216,17 @@ echo "[1/6] Loading MTD/JFFS2 modules..."
 insmod /modules/mtd.ko          && echo "  ✓ mtd.ko"       || echo "  ✗ mtd.ko"
 insmod /modules/mtd_blkdevs.ko  && echo "  ✓ mtd_blkdevs"  || echo "  ✗ mtd_blkdevs"
 insmod /modules/mtdblock.ko     && echo "  ✓ mtdblock"     || echo "  ✗ mtdblock"
-insmod /modules/block2mtd.ko    && echo "  ✓ block2mtd"    || echo "  ✗ block2mtd"
+insmod /modules/mtdram.ko total_size=16384 erase_size=64 && echo "  ✓ mtdram (16MB)" || echo "  ✗ mtdram"
 insmod /modules/jffs2.ko        && echo "  ✓ jffs2.ko"     || echo "  ✗ jffs2.ko"
 
 lsmod | grep -E "mtd|jffs2"
 
-# Step 2: Setup MTD device (CRITICAL for JFFS2)
-echo "[2/6] Setting up MTD device..."
+# Step 2: Setup MTD device (mtdram方式 - 推荐)
+echo "[2/6] Setting up MTD device (mtdram)..."
 if [ -f /jffs2.img ]; then
-    # Create loop device
-    losetup /dev/loop0 /jffs2.img && echo "  ✓ Loop device: /dev/loop0"
-    
-    # Register block2mtd
-    # Note: block2mtd parameter format varies by kernel version
-    # Newer kernels: use /sys/class/block2mtd/
-    # Older kernels: use direct device registration
-    
-    if [ -d /sys/class/block2mtd ]; then
-        echo "/dev/loop0" > /sys/class/block2mtd/register
-    else
-        echo "/dev/loop0,65536" > /sys/module/block2mtd/parameters/block2mtd_devices
-    fi
-    
-    sleep 1
+    # Write JFFS2 image to mtdblock device
+    dd if=/jffs2.img of=/dev/mtdblock0 bs=64K 2>&1 | head -5
+    echo "  ✓ Image written to mtdram device"
 fi
 
 # Step 3: Check MTD device status
@@ -270,9 +271,32 @@ chmod +x "$INITRAMFS_DIR/jffs2_mount_test.sh"
 |------|------|---------|
 | 架构匹配 | x86 busybox在ARM QEMU失败 | 交叉编译目标架构busybox |
 | 模块版本 | 内核模块版本不匹配 | 同一次编译会话构建内核+模块 |
-| MTD依赖 | JFFS2需要MTD设备 | 配置block2mtd或mtdram |
-| 命令缺失 | 脚本命令not found | 启用完整busybox applets |
+| MTD依赖 | JFFS2需要MTD设备 | **推荐mtdram**（避免block2mtd loop问题） |
+| 命令缺失 | busybox applets缺失(mknod/losetup) | 使用defconfig + 静态编译 + 创建symlinks |
+| TC模块 | busybox编译TC失败 | 禁用CONFIG_TC |
 | 挂载失败 | 无MTD设备可挂载 | 先setup_mtd，再mount |
+| loop失败 | losetup "No such device" | 使用mtdram替代block2mtd |
+
+**Busybox编译最佳实践**：
+
+```bash
+# ARM64完整busybox编译（解决applets缺失问题）
+cd /tmp/busybox-1.36.1
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+sed -i 's/CONFIG_TC=y/# CONFIG_TC is not set/' .config  # 禁用TC避免编译错误
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+
+# 验证busybox包含必要applets
+./busybox --list | grep -E "mknod|losetup|dd|mount|insmod|poweroff"
+
+# 创建initramfs时创建symlinks
+for applet in sh ash cat ls mkdir mount umount insmod lsmod rmmod dmesg \
+              grep sed sleep mknod poweroff reboot echo uname date dd \
+              head tail tr test losetup; do
+    ln -sf busybox "$INITRAMFS_DIR/bin/$applet"
+done
+```
 
 ### Step 4: 创建ARM64 initramfs
 
