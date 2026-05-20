@@ -394,50 +394,34 @@ ls ~/.claude/skills/
 
 ```
 Analysis-SKILL/
-├── README.md                       # This file (updated 2026-05-20)
-├── skills/
-│   ├── kernel-build/               # Skill 1: Kernel compilation
-│   │   ├── SKILL.md                # Skill definition
-│   │   ├── OPTIMIZATION_SUMMARY.md # Build optimizations
-│   │   └── VALIDATION_REPORT.md    # Validation results
-│   ├── qemu-test/                  # Skill 2: QEMU boot testing
-│   │   ├── SKILL.md                # Skill definition
-│   │   ├── scripts/                # Helper scripts
-│   │   │   ├── create_initramfs.sh
-│   │   │   ├── boot_arm64.sh
-│   │   │   ├── boot_arm32.sh
-│   │   │   ├── boot_x86.sh
-│   │   │   └── run_test.sh
-│   │   └── references/
-│   │       └── arch_configs.md     # Architecture-specific configs
-│   ├── jffs2-analyzer/             # Skill 3: Static JFFS2 analysis
-│   │   ├── SKILL.md                # Skill definition
-│   │   ├── README.md               # Analyzer documentation
-│   │   ├── scripts/
-│   │   │   └── jffs2_parser.py     # Python parser implementation
-│   │   └── references/
-│   │       └── jffs2_structures.md # JFFS2 format reference
-│   ├── jffs2-mount/                # Skill 4: JFFS2 mount testing
-│   │   ├── SKILL.md                # Skill definition (updated with mtdram)
-│   │   └── scripts/
-│   │       ├── create_jffs2_image.sh    # JFFS2 image creation
-│   │       ├── create_initramfs.sh      # Initramfs for mount test
-│   │       ├── mount_test.sh            # Mount test execution
-│   │       └── run_qemu.sh              # QEMU launch script
-│   └── jffs2-fault-inject/         # Skill 5: Fault injection
-│       ├── SKILL.md                # Skill definition
-│       ├── README.md               # Fault injector documentation
-│       ├── scripts/
-│       │   └ jffs2_fault_injector.py  # Python injector implementation
-│       └── examples/
-│           └── fault_scenarios.json    # Example fault scenarios
-├── docs/
-│   ├── E2E_VERIFICATION_REPORT.md  # End-to-end test report
-│   ├── TESTING_ISSUES_AND_SOLUTIONS.md  # Problem summary (2026-05-20)
-│   └── cross_arch_busybox_analysis.md  # Busybox cross-arch solution
-└── tools/                          # Additional utilities
+├── README.md                       # 项目总览
+├── skills/                         # 5个独立技能
+│   ├── kernel-build/SKILL.md       # Skill 1: 内核编译
+│   ├── qemu-test/SKILL.md          # Skill 2: QEMU启动
+│   ├── jffs2-analyzer/SKILL.md     # Skill 3: JFFS2静态分析
+│   ├── jffs2-mount/SKILL.md        # Skill 4: JFFS2挂载测试
+│   └── jffs2-fault-inject/SKILL.md # Skill 5: 故障注入
+├── docs/                           # 用户文档
+│   ├── VERIFICATION_REPORT.md      # 验证报告（合并ARM32/ARM64）
+│   ├── kernel-build-validation.md  # Kernel Build验证
+│   ├── OPTIMIZATION_HISTORY.md     # 优化历程
+│   ├── TESTING_ISSUES_AND_SOLUTIONS.md  # 测试问题总结
+│   ├── cross_arch_busybox_analysis.md   # 跨架构busybox指南
+│   └── jffs2-analyzer-guide.md     # JFFS2 Analyzer使用指南
+└── tools/                          # 辅助工具
 ```
 
+## 文档说明
+
+| 文档 | 内容 | 适合人群 |
+|------|------|---------|
+| VERIFICATION_REPORT.md | 端到端验证结果 | 查看测试状态 |
+| kernel-build-validation.md | Kernel Build测试 | 内核编译验证 |
+| OPTIMIZATION_HISTORY.md | Skills版本迭代 | 了解演进历史 |
+| TESTING_ISSUES_AND_SOLUTIONS.md | 问题解决方案 | 排错参考 |
+| cross_arch_busybox_analysis.md | Busybox编译指南 | 跨架构测试 |
+| jffs2-analyzer-guide.md | Analyzer使用指南 | JFFS2分析入门 |
+│       ├── scripts/
 ## Skill Architecture & Decoupling
 
 All 5 skills are **completely decoupled**:
