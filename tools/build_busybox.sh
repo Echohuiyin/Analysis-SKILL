@@ -1,7 +1,7 @@
 #!/bin/bash
 # Busybox Cross-Compilation Helper Script
 # Solves: architecture mismatch, interactive config, applet missing issues
-# Usage: build_busybox.sh --arch <arch> [--output <path>] [--applets <list>]
+# Usage: build_busybox.sh --arch <arch> [--output <path>] [--applets <list>] [--clean]
 
 set -e
 
@@ -10,7 +10,10 @@ ARCH=""
 OUTPUT_PATH=""
 CUSTOM_APPLETS=""
 BUSYBOX_VERSION="1.36.1"
+# 优先使用项目内源码
+BUNDLED_SOURCE="${SCRIPT_DIR}/busybox/busybox-${BUSYBOX_VERSION}.tar.bz2"
 DOWNLOAD_URL="https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2"
+CLEAN_BUILD=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -27,15 +30,21 @@ while [[ $# -gt 0 ]]; do
             CUSTOM_APPLETS="$2"
             shift 2
         ;;
+        --clean)
+            CLEAN_BUILD=true
+            shift
+        ;;
         --help)
-            echo "Usage: build_busybox.sh --arch <arch> [--output <path>] [--applets <list>]"
+            echo "Usage: build_busybox.sh --arch <arch> [--output <path>] [--applets <list>] [--clean]"
             echo ""
             echo "Architectures: arm64, arm32, x86_64"
-            echo "Output: Path to save compiled busybox (default: ./busybox_<arch>)"
+            echo "Output: Path to save compiled busybox (default: tools/busybox/prebuilt/busybox_<arch>)"
             echo "Applets: Comma-separated list of additional applets"
+            echo "Clean: Remove previous build for this architecture before compiling"
             echo ""
             echo "Example:"
             echo "  build_busybox.sh --arch arm64"
+            echo "  build_busybox.sh --arch arm64 --clean"
             echo "  build_busybox.sh --arch arm64 --output /tmp/busybox_arm64"
             echo "  build_busybox.sh --arch arm32 --applets wget,curl,vi"
             exit 0
@@ -76,9 +85,9 @@ case "$ARCH" in
     ;;
 esac
 
-# Default output path
+# Default output path - use prebuilt directory
 if [ -z "$OUTPUT_PATH" ]; then
-    OUTPUT_PATH="${SCRIPT_DIR}/../tools/busybox_${ARCH}"
+    OUTPUT_PATH="${SCRIPT_DIR}/busybox/prebuilt/busybox_${ARCH}"
 fi
 
 echo "=== Busybox Cross-Compilation Helper ==="
@@ -103,18 +112,33 @@ if [ -n "$CROSS_COMPILE" ]; then
     echo "✓ Cross-compiler found: ${CROSS_COMPILE}gcc"
 fi
 
-# Download busybox if not exists
+# Clean previous build if requested
 BUILD_DIR="/tmp/busybox_build_${ARCH}"
+if [ "$CLEAN_BUILD" = true ]; then
+    echo "[Clean] Removing previous build for $ARCH..."
+    rm -rf "$BUILD_DIR"
+    rm -f "$OUTPUT_PATH"
+    echo "✓ Cleaned: $BUILD_DIR and $OUTPUT_PATH"
+fi
+
+# Download busybox if not exists - prefer bundled source
 if [ ! -d "$BUILD_DIR/busybox-${BUSYBOX_VERSION}" ]; then
-    echo "[Download] Getting busybox source..."
+    echo "[Source] Getting busybox source..."
     mkdir -p "$BUILD_DIR"
     cd "$BUILD_DIR"
 
-    if [ ! -f "busybox-${BUSYBOX_VERSION}.tar.bz2" ]; then
-        wget -q "$DOWNLOAD_URL" || {
-            echo "ERROR: Failed to download busybox"
-            exit 1
-        }
+    # 优先使用项目内源码
+    if [ -f "$BUNDLED_SOURCE" ]; then
+        echo "✓ Using bundled source: $BUNDLED_SOURCE"
+        cp "$BUNDLED_SOURCE" "busybox-${BUSYBOX_VERSION}.tar.bz2"
+    else
+        if [ ! -f "busybox-${BUSYBOX_VERSION}.tar.bz2" ]; then
+            echo "  Bundled source not found, downloading..."
+            wget -q "$DOWNLOAD_URL" || {
+                echo "ERROR: Failed to download busybox"
+                exit 1
+            }
+        fi
     fi
 
     tar xf "busybox-${BUSYBOX_VERSION}.tar.bz2"

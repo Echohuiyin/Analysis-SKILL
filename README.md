@@ -20,7 +20,7 @@ All skills are **completely decoupled** - each skill operates independently with
 
 **Location**: `skills/kernel-build/`
 
-Build the OLK-6.6 Linux kernel with custom CONFIG options.
+Build the Linux kernel with custom CONFIG options (tested with openEuler kernel).
 
 **Key Features**:
 - ARM64/ARM32/x86_64 architecture support
@@ -179,13 +179,13 @@ Inject various faults into JFFS2 filesystem images for testing kernel fault hand
 /jffs2-mount --kernel Image --mount-test # Just mount
 ```
 
-Build the OLK-6.6 Linux kernel with custom CONFIG options.
+Build the Linux kernel with custom CONFIG options (tested with openEuler kernel).
 
 **Key Features**:
 - ARM64/ARM32/x86_64 architecture support
 - Native and cross-compilation
 - Automatic toolchain detection
-- openeuler_defconfig base configuration
+- Auto defconfig detection (prefers openeuler_defconfig)
 
 **Usage**:
 ```
@@ -245,7 +245,7 @@ Complete build and test cycle:
 
 **Build Requirements**:
 - GCC toolchain (native or cross)
-- Kernel source code (OLK-6.6)
+- Kernel source code (Linux kernel, openEuler kernel recommended)
 - Build dependencies: bc, bison, flex, libssl-dev
 
 **QEMU Requirements**:
@@ -493,8 +493,8 @@ Based on ARM64 end-to-end verification (2026-05-18):
 
 Problem example:
 ```
-Kernel:  6.6.0-36583-g6cf1cf61b43c-dirty
-Module:  6.6.0+ (vermagic mismatch)
+Kernel:  X.Y.Z-36583-gabc123-dirty
+Module:  X.Y.Z+ (vermagic mismatch)
 Result:  insmod fails with "invalid module format"
 ```
 
@@ -559,18 +559,17 @@ To add new skills or improve existing ones:
 
 ## License
 
-OpenEuler Linux Kernel (OLK-6.6) follows GPL v2 license.
+Linux kernel follows GPL v2 license.
 Skills and tools in this repository are provided under MIT license.
 
 ## Authors
 
-- Kernel Build Skill: Developed for OLK-6.6 cross-compilation workflow
+- Kernel Build Skill: Developed for Linux kernel cross-compilation workflow
 - QEMU Test Skill: Created for kernel verification automation
 - End-to-end validation: Completed 2026-05-18
 
 ## References
 
-- OLK-6.6 Repository: openEuler Linux Kernel 6.6
 - Kernel Documentation: Documentation/process/coding-style.rst
 - QEMU Documentation: https://www.qemu.org/docs/
 ## Verification Results
@@ -579,7 +578,7 @@ Skills and tools in this repository are provided under MIT license.
 
 | Item | Result | Details |
 |------|--------|---------|
-| Kernel | ✅ Pass | Image (37M), 6.6.0+ |
+| Kernel | ✅ Pass | Image (37M) |
 | jffs2.ko | ✅ Pass | Module load successful |
 | MTD | ✅ Pass | mtd.ko + jffs2.ko loaded |
 | QEMU Boot | ✅ Pass | Shell entered |
@@ -591,7 +590,7 @@ Skills and tools in this repository are provided under MIT license.
 
 | Item | Result | Details |
 |------|--------|---------|
-| Kernel | ✅ Pass | zImage (11M), 6.6.0+ |
+| Kernel | ✅ Pass | zImage (11M) |
 | jffs2.ko | ✅ Pass | Module load successful (149K) |
 | MTD | ✅ Pass | Built-in (CONFIG_MTD=y) |
 | QEMU Boot | ✅ Pass | Shell entered |

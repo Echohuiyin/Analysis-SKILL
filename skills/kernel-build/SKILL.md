@@ -1,11 +1,11 @@
 ---
 name: kernel-build
-description: Build Linux kernel with custom CONFIG options. Use this skill whenever the user wants to compile a kernel, build kernel modules, enable kernel config options, or test kernel features. Supports ARM64/ARM32/x86_64 architectures with openeuler_defconfig base, native and cross-compilation with auto toolchain detection.
+description: Build Linux kernel with custom CONFIG options. Use this skill whenever the user wants to compile a kernel, build kernel modules, enable kernel config options, or test kernel features. Supports ARM64/ARM32/x86_64 architectures with auto defconfig detection (prefers openeuler_defconfig), native and cross-compilation with auto toolchain detection.
 ---
 
 # Kernel Build Skill (v2.0)
 
-Compile the OLK-6.6 kernel with custom CONFIG options for different architectures.
+Compile the Linux kernel with custom CONFIG options for different architectures.
 Supports both native compilation and cross-compilation with automatic toolchain detection.
 
 ## When to Use
@@ -24,11 +24,11 @@ Trigger this skill when user asks to:
 Separate compilations will result in version mismatch:
 ```
 # ❌ WRONG - Separate builds cause mismatch
-Session 1: make Image          → Kernel 6.6.0-abc123
-Session 2: make modules        → Module 6.6.0+ (different vermagic)
+Session 1: make Image          → Kernel X.Y.Z-abc123
+Session 2: make modules        → Module X.Y.Z+ (different vermagic)
 
 # ✅ CORRECT - Same build session
-make Image && make modules     → Both 6.6.0+ (same vermagic)
+make Image && make modules     → Both X.Y.Z+ (same vermagic)
 ```
 
 This skill follows the correct workflow:
@@ -74,30 +74,63 @@ Examples:
 - **Default**: `$(nproc)` (all CPU cores)
 - **Custom**: Any number, typically matches CPU cores
 
-### Defconfig (`--defconfig`)
-- **Default**: `openeuler_defconfig` (for ARM64 and x86_64)
-- **ARM32**: Must specify alternative (no openeuler_defconfig exists)
-- **Common ARM32 options**: `bcm2835_defconfig`, `multi_v7_defconfig`, `omap2plus_defconfig`
+### Defconfig Auto-Detection
+
+The skill automatically detects the best defconfig based on availability:
+
+**Priority order**:
+1. **User specified**: `--defconfig <name>` parameter (highest priority)
+2. **openeuler_defconfig**: If `arch/<arch>/configs/openeuler_defconfig` exists, use it
+3. **defconfig**: Fallback to `arch/<arch>/configs/defconfig` (upstream kernel default)
+
+**Defconfig Detection Logic**:
+```bash
+detect_defconfig() {
+    local arch="$1"
+    local user_defconfig="$2"
+    local defconfig_path="arch/${arch}/configs"
+
+    # User specified - use directly
+    if [ -n "$user_defconfig" ]; then
+        echo "$user_defconfig"
+        return 0
+    fi
+
+    # Check openeuler_defconfig first (for openEuler kernel)
+    if [ -f "${defconfig_path}/openeuler_defconfig" ]; then
+        echo "openeuler_defconfig"
+        return 0
+    fi
+
+    # Fallback to upstream defconfig
+    if [ -f "${defconfig_path}/defconfig" ]; then
+        echo "defconfig"
+        return 0
+    fi
+
+    # No default found - list available options
+    echo "ERROR: No default defconfig found for $arch"
+    echo "Available defconfigs:"
+    ls "${defconfig_path}"/*.defconfig 2>/dev/null | head -10
+    return 1
+}
+```
+
+**ARM32 Note**: openeuler_defconfig typically doesn't exist for ARM32. The skill will fallback to `defconfig` or require user to specify `--defconfig`.
+
+**Common ARM32 defconfigs**:
+- `bcm2835_defconfig` - Raspberry Pi
+- `multi_v7_defconfig` - Multi-platform ARMv7
+- `omap2plus_defconfig` - TI OMAP platforms
+- `sunxi_defconfig` - Allwinner sunxi
 
 ## Architecture Support Matrix
 
-| Architecture | ARCH Var | Image Target | Output Path | openeuler_defconfig | Cross Toolchain |
-|--------------|----------|--------------|-------------|---------------------|-----------------|
-| **ARM64** | `arm64` | Image | `arch/arm64/boot/Image` | ✅ Yes | `aarch64-linux-gnu-` |
-| **ARM32** | `arm` | zImage | `arch/arm/boot/zImage` | ❌ No | `arm-linux-gnueabi-` |
-| **x86_64** | `x86` | bzImage | `arch/x86/boot/bzImage` | ✅ Yes | Native (gcc) |
-
-### Defconfig Availability Check
-```bash
-# Check if openeuler_defconfig exists for target architecture
-DEFCONFIG_PATH="arch/<arch>/configs/openeuler_defconfig"
-if [ ! -f "$DEFCONFIG_PATH" ]; then
-    echo "⚠️ openeuler_defconfig not available for <arch>"
-    echo "Available defconfigs:"
-    ls arch/<arch>/configs/*.defconfig | head -10
-    # User must specify --defconfig or use default alternative
-fi
-```
+| Architecture | ARCH Var | Image Target | Output Path | Defconfig Priority | Cross Toolchain |
+|--------------|----------|--------------|-------------|-------------------|-----------------|
+| **ARM64** | `arm64` | Image | `arch/arm64/boot/Image` | openeuler → defconfig | `aarch64-linux-gnu-` |
+| **ARM32** | `arm` | zImage | `arch/arm/boot/zImage` | defconfig (user specify) | `arm-linux-gnueabi-` |
+| **x86_64** | `x86` | bzImage | `arch/x86/boot/bzImage` | openeuler → defconfig | Native (gcc) |
 
 ## Cross-Compilation Detection
 
@@ -175,15 +208,22 @@ echo "  Defconfig: $DEFCONFIG"
 echo "  Jobs:      $JOBS"
 ```
 
-### Step 1: Load Base Defconfig
+### Step 1: Load Base Defconfig (Auto-Detection)
 ```bash
-# Handle ARM32 missing openeuler_defconfig
-if [ "$ARCH" = "arm" ] && [ "$DEFCONFIG" = "openeuler_defconfig" ]; then
-    if [ ! -f "arch/arm/configs/openeuler_defconfig" ]; then
-        echo "⚠️ openeuler_defconfig not found for ARM32"
-        echo "Falling back to: multi_v7_defconfig"
-        DEFCONFIG="multi_v7_defconfig"
-    fi
+# Auto-detect best defconfig
+DEFCONFIG=$(detect_defconfig "$ARCH" "$USER_DEFCONFIG")
+
+if [ -z "$DEFCONFIG" ]; then
+    echo "ERROR: No suitable defconfig found"
+    echo "Please specify --defconfig <name>"
+    exit 1
+fi
+
+echo "✓ Using defconfig: $DEFCONFIG"
+if [ "$DEFCONFIG" = "openeuler_defconfig" ]; then
+    echo "  (openEuler kernel detected)"
+elif [ "$DEFCONFIG" = "defconfig" ]; then
+    echo "  (upstream kernel default)"
 fi
 
 make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE $DEFCONFIG
@@ -294,7 +334,7 @@ Build Time: 3m 25s
 
 ## Example Builds (Enhanced)
 
-### Example 1: Native x86_64 Build
+### Example 1: Native x86_64 Build (openEuler kernel)
 ```
 /kernel-build UB XCU_SCHEDULER --arch x86_64 --jobs 32
 ```
@@ -304,7 +344,10 @@ Output:
 ✓ Environment check
   Host: x86_64, Target: x86_64 → Native build (no cross)
   Toolchain: gcc (native)
-  Defconfig: arch/x86/configs/openeuler_defconfig ✓
+
+✓ Defconfig auto-detection
+  Checking: arch/x86/configs/openeuler_defconfig → Found
+  Using: openeuler_defconfig (openEuler kernel)
 
 ✓ Step 1: Loaded openeuler_defconfig (ARCH=x86)
 ✓ Step 2: Enabled CONFIG_UB CONFIG_XCU_SCHEDULER
@@ -326,7 +369,7 @@ Kernel images:
 Build time: 3m 25s
 ```
 
-### Example 2: Cross-Compile ARM64 from x86_64
+### Example 2: Cross-Compile ARM64 from x86_64 (openEuler kernel)
 ```
 /kernel-build ARM64_MPAM --arch arm64 --cross --jobs 64
 ```
@@ -336,7 +379,10 @@ Output:
 ✓ Environment check
   Host: x86_64, Target: arm64 → Cross-compilation required
   Toolchain: aarch64-linux-gnu-gcc 13.2.0 ✓
-  Defconfig: arch/arm64/configs/openeuler_defconfig ✓
+
+✓ Defconfig auto-detection
+  Checking: arch/arm64/configs/openeuler_defconfig → Found
+  Using: openeuler_defconfig (openEuler kernel)
 
 ✓ Step 1: Loaded openeuler_defconfig (ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-)
 ✓ Step 2: Enabled CONFIG_ARM64_MPAM
@@ -369,8 +415,9 @@ Output:
 ✓ Environment check
   Host: x86_64, Target: arm32 → Cross-compilation required
   Toolchain: arm-linux-gnueabi-gcc 13.2.0 ✓
-  ⚠️ openeuler_defconfig not available for ARM32
-  Using: bcm2835_defconfig (Raspberry Pi)
+
+✓ Defconfig auto-detection
+  User specified: bcm2835_defconfig (Raspberry Pi)
 
 ✓ Step 1: Loaded bcm2835_defconfig (ARCH=arm CROSS_COMPILE=arm-linux-gnueabi-)
 ✓ Step 2: Enabled CONFIG_JFFS2_FS (tristate → =m)
@@ -414,7 +461,29 @@ Proceeding with cross-compile...
   [Build continues as Example 2]
 ```
 
-### Example 5: Missing Toolchain Error
+### Example 5: Upstream Kernel (no openeuler_defconfig)
+```
+/kernel-build JFFS2_FS --arch arm64 --jobs 32
+```
+
+Output (using upstream kernel without openeuler_defconfig):
+```
+✓ Environment check
+  Host: x86_64, Target: arm64 → Cross-compilation required
+  Toolchain: aarch64-linux-gnu-gcc 13.2.0 ✓
+
+✓ Defconfig auto-detection
+  Checking: arch/arm64/configs/openeuler_defconfig → Not found
+  Checking: arch/arm64/configs/defconfig → Found
+  Using: defconfig (upstream kernel default)
+
+✓ Step 1: Loaded defconfig (ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-)
+✓ Step 2: Enabled CONFIG_JFFS2_FS (tristate → =m)
+✓ Step 3: Dependencies resolved
+  [Build continues normally]
+```
+
+### Example 6: Missing Toolchain Error
 ```
 /kernel-build UB --arch arm32 --cross
 ```
@@ -437,9 +506,13 @@ Alternative: Use native ARM32 machine or specify correct toolchain prefix.
 
 ## Error Handling
 
-### Missing Defconfig (ARM32)
+### Missing Defconfig
 ```
-ERROR: openeuler_defconfig not found for ARM32
+ERROR: No suitable defconfig found for arm32
+
+Checked:
+  - arch/arm/configs/openeuler_defconfig → Not found
+  - arch/arm/configs/defconfig → Not found
 
 Available ARM32 defconfigs:
   - bcm2835_defconfig (Raspberry Pi)

@@ -1,14 +1,21 @@
 #!/bin/bash
 # Create ARM64 initramfs for JFFS2 mount testing
-# Usage: create_initramfs.sh [--kernel <path>] [--modules <dir>] [--jffs2-image <path>]
+# Usage: create_initramfs.sh [--kernel <path>] [--modules <dir>] [--jffs2-image <path>] [--arch <arch>]
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 KERNEL_PATH=""
 MODULES_DIR=""
 JFFS2_IMAGE=""
 ARCH="arm64"
+BUSYBOX_VERSION="1.36.1"
+
+# 架构映射
+ARCH_MAP_ARM64="ARM aarch64|aarch64"
+ARCH_MAP_ARM32="ARM,|armv7l|ARM,"
+ARCH_MAP_X86_64="x86-64|x86_64"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -43,29 +50,77 @@ INITRAMFS_FILE="$OUTPUT_DIR/initramfs_jffs2.cpio.gz"
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$INITRAMFS_DIR"/{bin,dev,proc,sys,etc,lib,mnt,modules}
 
-echo "Creating ARM64 initramfs for JFFS2 mount test..."
+echo "Creating initramfs for JFFS2 mount test (arch: $ARCH)..."
 
-# Step 1: Setup busybox
-BUSYBOX=""
-if [ "$ARCH" = "arm64" ]; then
-    # Use cross-compiled ARM64 busybox
-    BUSYBOX="/tmp/busybox_build/busybox-1.36.1/busybox"
-    if [ ! -f "$BUSYBOX" ]; then
-        echo "ARM64 busybox not found at $BUSYBOX"
-        echo "Cross-compile busybox first or use pre-built version"
-        # Try to use existing busybox from previous build
-        BUSYBOX="/home/liumingrui/.claude/projects/*/memory/busybox_arm64"
+# === 架构检测函数 ===
+detect_busybox_arch() {
+    local busybox="$1"
+    if [ ! -f "$busybox" ]; then
+        echo "unknown"
+        return 1
     fi
-elif [ "$ARCH" = "x86_64" ]; then
-    BUSYBOX="/usr/bin/busybox"
-fi
+    local info=$(file "$busybox" 2>/dev/null)
 
-if [ -f "$BUSYBOX" ]; then
+    if echo "$info" | grep -qE "ARM aarch64"; then
+        echo "arm64"
+    elif echo "$info" | grep -qE "ARM,"; then
+        echo "arm32"
+    elif echo "$info" | grep -qE "x86-64"; then
+        echo "x86_64"
+    else
+        echo "unknown"
+    fi
+}
+
+# === 查找并验证 busybox ===
+find_busybox() {
+    local target_arch="$1"
+    local candidates=(
+        # 优先使用项目内预编译版本
+        "${PROJECT_ROOT}/tools/busybox/prebuilt/busybox_${target_arch}"
+        # 新构建路径
+        "/tmp/busybox_build_${target_arch}/busybox-${BUSYBOX_VERSION}/busybox"
+        # 旧构建路径（兼容）
+        "/tmp/busybox_build/busybox-${BUSYBOX_VERSION}/busybox"
+        # 系统busybox
+        "/usr/bin/busybox"
+        "/bin/busybox"
+    )
+
+    for busybox in "${candidates[@]}"; do
+        if [ -x "$busybox" ]; then
+            local detected_arch=$(detect_busybox_arch "$busybox")
+            if [ "$detected_arch" = "$target_arch" ]; then
+                echo "$busybox"
+                return 0
+            else
+                echo "⚠️  Busybox at $busybox is $detected_arch, but need $target_arch (skipping)" >&2
+            fi
+        fi
+    done
+    return 1
+}
+
+# Step 1: Setup busybox with architecture detection
+echo "[Busybox] Finding architecture-matched busybox..."
+
+BUSYBOX=$(find_busybox "$ARCH")
+
+if [ -n "$BUSYBOX" ] && [ -f "$BUSYBOX" ]; then
+    DETECTED_ARCH=$(detect_busybox_arch "$BUSYBOX")
+    echo "✓ Busybox found: $BUSYBOX"
+    echo "  Architecture: $DETECTED_ARCH (matches target: $ARCH)"
     cp "$BUSYBOX" "$INITRAMFS_DIR/bin/busybox"
-    echo "✓ Busybox installed: $BUSYBOX"
 else
-    echo "✗ Busybox not available for $ARCH"
+    echo "✗ No valid busybox found for $ARCH"
     echo "  Required for: sh, mount, insmod, etc."
+    echo ""
+    echo "Solution: Build busybox for $ARCH"
+    echo "  cd ${PROJECT_ROOT}/tools"
+    echo "  ./build_busybox.sh --arch $ARCH --clean"
+    echo ""
+    echo "Or use pre-built system busybox (x86_64 only):"
+    echo "  /kernel-build JFFS2_FS --arch x86_64"
     exit 1
 fi
 

@@ -1,16 +1,69 @@
 #!/bin/bash
 # Create minimal initramfs for QEMU kernel testing
-# Usage: create_initramfs.sh [--test-script <path>] [--modules <path>] [--interactive]
+# Usage: create_initramfs.sh [--test-script <path>] [--modules <path>] [--interactive] [--arch <arch>]
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUTPUT_DIR="/tmp/initramfs_${ARCH:-arm64}"
-OUTPUT_FILE="/tmp/initramfs.cpio.gz"
+PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+BUSYBOX_VERSION="1.36.1"
+ARCH="${ARCH:-arm64}"  # Default to arm64, can be overridden
+
+OUTPUT_DIR="/tmp/initramfs_${ARCH}"
+OUTPUT_FILE="/tmp/initramfs_${ARCH}.cpio.gz"
 
 TEST_SCRIPT=""
 MODULES_DIR=""
 INTERACTIVE=0
+
+# 架构映射
+detect_busybox_arch() {
+    local busybox="$1"
+    if [ ! -f "$busybox" ]; then
+        echo "unknown"
+        return 1
+    fi
+    local info=$(file "$busybox" 2>/dev/null)
+
+    if echo "$info" | grep -qE "ARM aarch64"; then
+        echo "arm64"
+    elif echo "$info" | grep -qE "ARM,"; then
+        echo "arm32"
+    elif echo "$info" | grep -qE "x86-64"; then
+        echo "x86_64"
+    else
+        echo "unknown"
+    fi
+}
+
+# 查找并验证 busybox
+find_busybox() {
+    local target_arch="$1"
+    local candidates=(
+        # 优先使用项目内预编译版本
+        "${PROJECT_ROOT}/tools/busybox/prebuilt/busybox_${target_arch}"
+        # 新构建路径
+        "/tmp/busybox_build_${target_arch}/busybox-${BUSYBOX_VERSION}/busybox"
+        # 旧构建路径（兼容）
+        "/tmp/busybox_build/busybox-${BUSYBOX_VERSION}/busybox"
+        # 系统busybox
+        "/usr/bin/busybox"
+        "/bin/busybox"
+    )
+
+    for busybox in "${candidates[@]}"; do
+        if [ -x "$busybox" ]; then
+            local detected_arch=$(detect_busybox_arch "$busybox")
+            if [ "$detected_arch" = "$target_arch" ]; then
+                echo "$busybox"
+                return 0
+            else
+                echo "⚠️  Busybox at $busybox is $detected_arch, but need $target_arch (skipping)" >&2
+            fi
+        fi
+    done
+    return 1
+}
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -31,6 +84,12 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_FILE="$2"
             shift 2
         ;;
+        --arch)
+            ARCH="$2"
+            OUTPUT_DIR="/tmp/initramfs_${ARCH}"
+            OUTPUT_FILE="/tmp/initramfs_${ARCH}.cpio.gz"
+            shift 2
+        ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -38,35 +97,44 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "Creating minimal initramfs..."
+echo "Creating minimal initramfs for $ARCH..."
 
 # Clean and create directory structure
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"/{bin,dev,proc,sys,etc,lib,modules}
 
-# Check for busybox
-BUSYBOX=""
-if command -v busybox &> /dev/null; then
-    BUSYBOX=$(command -v busybox)
-elif [ -f /bin/busybox ]; then
-    BUSYBOX=/bin/busybox
-else
-    echo "ERROR: busybox not found. Please install busybox-static."
-    echo "  Ubuntu/Debian: apt install busybox-static"
-    echo "  CentOS/RHEL: yum install busybox"
-    exit 1
-fi
+# Find busybox with architecture detection
+BUSYBOX=$(find_busybox "$ARCH")
 
-# Copy busybox (static linked version preferred)
-if ldd "$BUSYBOX" 2>&1 | grep -q "not a dynamic executable"; then
-    cp "$BUSYBOX" "$OUTPUT_DIR/bin/busybox"
+if [ -n "$BUSYBOX" ] && [ -f "$BUSYBOX" ]; then
+    DETECTED_ARCH=$(detect_busybox_arch "$BUSYBOX")
+    echo "✓ Busybox found: $BUSYBOX"
+    echo "  Architecture: $DETECTED_ARCH (matches target: $ARCH)"
+
+    # Check static linking
+    if ldd "$BUSYBOX" 2>&1 | grep -q "not a dynamic executable"; then
+        echo "  Static linking: yes (ideal for initramfs)"
+        cp "$BUSYBOX" "$OUTPUT_DIR/bin/busybox"
+    else
+        echo "  Static linking: no (may need additional libraries)"
+        echo "  Recommend: rebuild with CONFIG_STATIC=y"
+        cp "$BUSYBOX" "$OUTPUT_DIR/bin/busybox"
+        # Copy required libraries (basic attempt)
+        ldd "$BUSYBOX" | grep -o "/lib[^ ]*" | while read lib; do
+            cp "$lib" "$OUTPUT_DIR/lib/" 2>/dev/null || true
+        done
+    fi
 else
-    echo "Warning: busybox is not static-linked. May need additional libraries."
-    cp "$BUSYBOX" "$OUTPUT_DIR/bin/busybox"
-    # Copy required libraries (basic attempt)
-    ldd "$BUSYBOX" | grep -o "/lib[^ ]*" | while read lib; do
-        cp "$lib" "$OUTPUT_DIR/lib/" 2>/dev/null || true
-    done
+    echo "✗ No valid busybox found for $ARCH"
+    echo "  Architecture mismatch may cause QEMU boot failure"
+    echo ""
+    echo "Solution: Build busybox for $ARCH"
+    echo "  cd ${PROJECT_ROOT}/tools"
+    echo "  ./build_busybox.sh --arch $ARCH --clean"
+    echo ""
+    echo "Or for x86_64 native testing:"
+    echo "  sudo apt install busybox-static"
+    exit 1
 fi
 
 # Create busybox symlinks

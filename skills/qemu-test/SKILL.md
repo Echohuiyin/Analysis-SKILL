@@ -5,7 +5,7 @@ description: Boot kernel in QEMU for verification and testing. Use this skill wh
 
 # QEMU Kernel Testing Skill
 
-Boot and test the OLK-6.6 kernel in QEMU virtual machine. **Focus on QEMU execution, not kernel build.**
+Boot and test the Linux kernel in QEMU virtual machine. **Focus on QEMU execution, not kernel build.**
 
 ## When to Use
 
