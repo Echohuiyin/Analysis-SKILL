@@ -1,10 +1,10 @@
 # Kernel Analysis Skills Collection
 
-This repository contains Claude Code skills for kernel compilation, QEMU testing, JFFS2 filesystem analysis, and fault injection testing.
+This repository contains Claude Code skills for kernel compilation, QEMU testing, JFFS2 filesystem analysis, vmcore crash dump analysis, and lock debugging.
 
 ## Overview
 
-Six independent and decoupled skills for kernel development workflow and case retrieval:
+Nine independent skills for kernel development and debugging workflow:
 
 - **kernel-build**: Compile Linux kernels with custom configurations
 - **qemu-test**: Boot kernels in QEMU for testing and verification
@@ -12,12 +12,112 @@ Six independent and decoupled skills for kernel development workflow and case re
 - **jffs2-mount**: Mount JFFS2 images in QEMU for dynamic verification
 - **jffs2-fault-inject**: Inject faults into JFFS2 images for testing
 - **rag-case-retrieval**: RAG-based semantic case retrieval from vector database
+- **vmcore-analyzer**: Complete vmcore crash dump analysis workflow with MCP integration
+- **lock-analyzer**: Analyze kernel locks (mutex/spinlock/semaphore) to find lock owners and detect deadlocks
 
-All skills are **completely decoupled** - each skill operates independently without calling or depending on other skills.
+## MCP Server Integration
+
+This project includes an MCP Server (`aicrasher`) that provides crash analysis tools:
+
+### MCP Tools (9 tools exposed)
+
+| Tool | Purpose |
+|------|---------|
+| `analyze_crash` | Entry point: create session + collect baseline (sys/bt/log) |
+| `create_crash_session` | Create crash session, returns session_id |
+| `run_crash_command` | Execute single crash command in session |
+| `run_crash_commands` | Execute multiple crash commands sequentially |
+| `collect_baseline` | Collect sys, bt, log \| tail -n 100 |
+| `export_command_log` | Export command history to JSONL |
+| `close_crash_session` | Close session and cleanup |
+| `search_knowledge_base` | Search local KB + Red Hat KB |
+| `list_sessions` | List active sessions |
+
+### MCP Server Installation
+
+```bash
+# Install MCP Python package
+pip install -e .[cli]
+
+# Register MCP Server with Claude Code
+claude mcp add aicrasher -- python3 -m aicrasher.mcp_server
+```
+
+### Configuration
+
+Copy `.env.example` to `.env` and configure:
+- `CRASH_BINARY` - Path to crash utility (default: /usr/bin/crash)
+- `CRASH_OUTPUT_MAX_CHARS` - Max chars per command output (default: 16384)
+- `KNOWLEDGE_BASE_PATHS` - Local KB directories (colon-separated)
 
 ## Skills
 
-### 1. kernel-build Skill
+### 1. vmcore-analyzer Skill (NEW)
+
+**Location**: `skills/vmcore-analyzer/`
+
+Complete 7-phase vmcore crash dump analysis workflow.
+
+**Key Features**:
+- MCP-powered crash session management
+- Automatic command logging to JSONL
+- Knowledge base integration (local + Red Hat KB)
+- HTML report generation with `@cmd[]` references
+- Scenario-specific analysis guides
+
+**Workflow Phases**:
+| Phase | Name | Output |
+|-------|------|--------|
+| Phase 0 | Environment check | MCP ready |
+| Phase 1 | Baseline collection | sys/bt/log |
+| Phase 2 | Panic type identification | Panic category |
+| Phase 3 | Deep analysis | Root cause |
+| Phase 4 | Community fix search | Fix commits (conditional) |
+| Phase 5 | Mitigation analysis | Recommendations |
+| Phase 6 | Report generation | HTML report |
+| Phase 7 | Session cleanup | Session closed |
+
+**Usage**:
+```
+/vmcore-analyzer <vmcore-path> <vmlinux-path> [kernel-src-path]
+```
+
+**Examples**:
+```
+/vmcore-analyzer /data/vmcore /data/vmlinux
+/vmcore-analyzer /path/to/vmcore /path/to/vmlinux /path/to/kernel-src
+```
+
+### 2. lock-analyzer Skill (Updated)
+
+**Location**: `skills/lock-analyzer/`
+
+Analyze kernel locks using MCP tools.
+
+**Key Features**:
+- MCP integration for crash commands
+- Mutex owner identification via `owner` field
+- Spinlock contention analysis (ticket lock, qspinlock)
+- Semaphore wait queue analysis
+- Deadlock detection and circular dependency checking
+
+**Lock Types Supported**:
+
+| Lock Type | Structure | Owner Tracking | Use Case |
+|-----------|-----------|----------------|----------|
+| Mutex | `struct mutex` | ✅ `owner` field | Long critical sections, sleepable |
+| Spinlock | `raw_spinlock_t` | ❌ Indirect via stack | Short critical sections, IRQ handlers |
+| Semaphore | `struct semaphore` | ❌ Counting semaphore | Resource counting, synchronization |
+
+**Usage**:
+```
+/lock-analyzer <lock-address> [--type mutex|spinlock|semaphore]
+/lock-analyzer --deadlock-check
+```
+
+**Note**: Requires active crash session (created via MCP `analyze_crash` or `create_crash_session`).
+
+### 3. kernel-build Skill
 
 **Location**: `skills/kernel-build/`
 
@@ -41,13 +141,7 @@ Build the Linux kernel with custom CONFIG options (tested with openEuler kernel)
 /kernel-build ARM64_MPAM --arch arm64 --cross --jobs 64
 ```
 
-**Output**:
-- Kernel Image (arch/arm64/boot/Image, arch/x86/boot/bzImage)
-- Kernel Modules (*.ko files)
-
-**Important**: Kernel and modules must be compiled in the SAME build session to ensure version matching.
-
-### 2. qemu-test Skill
+### 4. qemu-test Skill
 
 **Location**: `skills/qemu-test/`
 
@@ -64,16 +158,7 @@ Boot kernels in QEMU and run automated tests.
 /qemu-test --arch arm64 --kernel <path> --modules <path> [--script <path>]
 ```
 
-**Examples**:
-```
-/qemu-test --arch arm64 --interactive
-/qemu-test --script tests/jffs2_test.sh --timeout 60
-/qemu-test --kernel arch/x86/boot/bzImage --arch x86_64
-```
-
-**Decoupled**: This skill does NOT call kernel-build. It expects user to provide pre-compiled kernel.
-
-### 3. jffs2-analyzer Skill
+### 5. jffs2-analyzer Skill
 
 **Location**: `skills/jffs2-analyzer/`
 
@@ -90,218 +175,41 @@ Static analysis of JFFS2 filesystem images without mounting.
 /jffs2-analyzer <jffs2-image> [--output <dir>] [--verbose]
 ```
 
-**Examples**:
-```
-/jffs2-analyzer /path/to/jffs2.img
-/jffs2-analyzer test.jffs2 --output analysis_results
-```
-
-**Decoupled**: Standalone Python-based analysis, no dependencies on kernel-build or qemu-test.
-
-### 4. jffs2-mount Skill
+### 6. jffs2-mount Skill
 
 **Location**: `skills/jffs2-mount/`
 
 Mount JFFS2 filesystem images in QEMU for dynamic verification.
-
-**Key Features**:
-- Create JFFS2 test images (mkfs.jffs2 or blank)
-- Setup MTD device in QEMU (mtdram method recommended)
-- Load JFFS2 module and mount filesystem
-- Verify mount success and file access
 
 **Usage**:
 ```
 /jffs2-mount --kernel <path> [--image <path>] [--size <MB>] [--mount-test]
 ```
 
-**Examples**:
-```
-/jffs2-mount --kernel arch/arm64/boot/Image --mount-test
-/jffs2-mount --kernel Image --image custom.jffs2 --arch arm64
-/jffs2-mount --kernel bzImage --size 32 --content ./data
-```
-
-**Recommended**: Use mtdram instead of block2mtd to avoid loop device issues.
-
-**Decoupled**: This skill is COMPLETELY INDEPENDENT from:
-- kernel-build (requires user-provided kernel)
-- qemu-test (has its own QEMU launch logic)
-- jffs2-analyzer (complementary - analyze first, then mount)
-
-### 5. jffs2-fault-inject Skill
+### 7. jffs2-fault-inject Skill
 
 **Location**: `skills/jffs2-fault-inject/`
 
-Inject various faults into JFFS2 filesystem images for testing kernel fault handling.
+Inject various faults into JFFS2 filesystem images for testing.
 
-**Key Features**:
-- Inject CRC errors (hdr_crc, node_crc, data_crc, name_crc)
-- Inject magic number corruption (0xDEAD)
-- Inject invalid node types
-- Generate fault injection report JSON
-- Compatible with jffs2-analyzer for validation
+**Fault Types**:
+- `hdr_crc`, `node_crc`, `data_crc`, `name_crc`
+- `magic`, `nodetype`, `version_zero`
 
 **Usage**:
 ```
 /jffs2-fault-inject --image <path> [--fault <type>] [--output <dir>]
 ```
 
-**Fault Types**:
-- `hdr_crc`: Corrupt node header CRC
-- `node_crc`: Corrupt node structure CRC
-- `data_crc`: Corrupt data payload CRC
-- `name_crc`: Corrupt dirent name CRC
-- `magic`: Invalid magic number (0xDEAD)
-- `nodetype`: Invalid node type
-- `version_zero`: Zero version field
-
-**Examples**:
-```
-/jffs2-fault-inject --image normal.jffs2 --fault hdr_crc,node_crc,magic
-/jffs2-fault-inject --image test.jffs2 --fault all --output fault_output
-```
-
-**Decoupled**: Standalone Python-based fault injection, can be used before jffs2-analyzer or jffs2-mount.
-
-### 6. rag-case-retrieval Skill
+### 8. rag-case-retrieval Skill
 
 **Location**: `skills/rag-case-retrieval/`
 
 RAG-based semantic case retrieval from Chroma vector database.
 
-**Key Features**:
-- Multi-source data import (PostgreSQL, JSON, CSV)
-- Intelligent text chunking (semantic boundaries + overlap)
-- OpenAI Embedding vectorization
-- Chroma vector storage and retrieval
-- Metadata filtering (time, category, tags)
-- Structured JSON output (top-3 cases)
-
-**Prerequisites**:
-- Chroma Docker service running on localhost:8000
-- OpenAI API Key configured
-- Python dependencies: chromadb, openai, psycopg2-binary
-
 **Usage**:
 ```
-# Import cases from database
-python skills/rag-case-retrieval/scripts/import_cases.py --source database
-
-# Import from JSON file
-python skills/rag-case-retrieval/scripts/import_cases.py --source json --file cases.json
-
-# Retrieve similar cases
-python skills/rag-case-retrieval/scripts/retrieve_cases.py "JWT认证失败" --top-k 3
-
-# Retrieve with filters
-python skills/rag-case-retrieval/scripts/retrieve_cases.py "性能优化" \
-  --filters '{"category": "性能", "created_at": {"$gte": "2024-01-01"}}'
-```
-
-**Output Format**:
-```json
-{
-  "query": "用户查询",
-  "results": [
-    {
-      "id": "case_001",
-      "title": "案例标题",
-      "content": "案例内容",
-      "similarity_score": 0.85,
-      "metadata": {"category": "安全", "tags": ["JWT"]}
-    }
-  ],
-  "summary": {
-    "total_found": 3,
-    "retrieval_time_ms": 245
-  }
-}
-```
-
-**Documentation**: See `docs/rag-case-retrieval-guide.md` for complete usage guide.
-
-**Decoupled**: Standalone Python-based RAG system, no dependencies on other skills.
-
-**Workflow Integration**: Users can combine skills as needed:
-```
-# Option 1: Full fault testing workflow
-/kernel-build JFFS2_FS --arch arm64 --cross
-/jffs2-fault-inject --image normal.jffs2 --fault hdr_crc,magic
-/jffs2-analyzer corrupted.jffs2
-/jffs2-mount --kernel arch/arm64/boot/Image --image corrupted.jffs2
-
-# Option 2: Each skill independently
-/kernel-build UB --arch x86_64           # Just build
-/qemu-test --arch arm64 --interactive    # Just boot
-/jffs2-analyzer image.jffs2              # Just analyze
-/jffs2-fault-inject --image test.jffs2   # Just inject faults
-/jffs2-mount --kernel Image --mount-test # Just mount
-
-# Option 3: RAG case retrieval workflow
-python skills/rag-case-retrieval/scripts/check_environment.py
-python skills/rag-case-retrieval/scripts/import_cases.py --source database
 python skills/rag-case-retrieval/scripts/retrieve_cases.py "查询文本" --top-k 3
-```
-
-Build the Linux kernel with custom CONFIG options (tested with openEuler kernel).
-
-**Key Features**:
-- ARM64/ARM32/x86_64 architecture support
-- Native and cross-compilation
-- Automatic toolchain detection
-- Auto defconfig detection (prefers openeuler_defconfig)
-
-**Usage**:
-```
-/kernel-build <config-options> [--arch <arch>] [--cross] [--jobs <N>]
-```
-
-**Examples**:
-```
-/kernel-build CONFIG_JFFS2_FS=m --arch arm64 --cross
-/kernel-build UB XCU_SCHEDULER --arch x86_64 --jobs 32
-/kernel-build ARM64_MPAM --arch arm64 --cross --jobs 64
-```
-
-**Output**:
-- Kernel Image (arch/arm64/boot/Image, arch/x86/boot/bzImage)
-- Kernel Modules (*.ko files)
-
-**Important**: Kernel and modules must be compiled in the SAME build session to ensure version matching.
-
-### qemu-test Skill
-
-Boot kernels in QEMU and run automated tests.
-
-**Key Features**:
-- Multi-architecture QEMU support (ARM64/ARM32/x86_64)
-- Minimal initramfs creation with busybox
-- Module loading tests
-- Automated test script execution
-
-**Usage**:
-```
-/kemu-test --arch arm64 --kernel <path> --modules <path> [--script <path>]
-```
-
-**Examples**:
-```
-/qemu-test --arch arm64 --interactive
-/qemu-test --script tests/jffs2_test.sh --timeout 60
-/qemu-test --kernel arch/x86/boot/bzImage --arch x86_64
-```
-
-## Workflow Example
-
-Complete build and test cycle:
-
-```
-# Step 1: Build kernel with module
-/kernel-build JFFS2_FS --arch arm64 --cross
-
-# Step 2: Test in QEMU
-/qemu-test --arch arm64 --kernel arch/arm64/boot/Image --modules fs/jffs2/jffs2.ko
 ```
 
 ## Installation
@@ -310,425 +218,190 @@ Complete build and test cycle:
 
 **Build Requirements**:
 - GCC toolchain (native or cross)
-- Kernel source code (Linux kernel, openEuler kernel recommended)
+- Kernel source code
 - Build dependencies: bc, bison, flex, libssl-dev
 
 **QEMU Requirements**:
-- qemu-system-aarch64 (ARM64)
-- qemu-system-arm (ARM32)
-- qemu-system-x86_64 (x86_64)
+- qemu-system-aarch64, qemu-system-arm, qemu-system-x86_64
 - ARM64 static busybox for cross-architecture testing
 
-**RAG Retrieval Requirements**:
-- Python 3.8+
-- Chroma Docker service (chromadb/chroma image)
-- OpenAI API Key
-- PostgreSQL client libraries (for database import)
+**MCP/Crash Requirements**:
+- Python 3.10+
+- crash utility (`/usr/bin/crash`)
+- vmlinux (uncompressed debug kernel image)
+- vmcore (crash dump file)
 
-**Cross-Compilation Toolchain** (Ubuntu/Debian):
-```bash
-sudo apt install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu  # ARM64
-sudo apt install gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi  # ARM32
-```
-
-**QEMU Installation**:
-```bash
-sudo apt install qemu-system-arm qemu-system-x86
-```
-
-**RAG Dependencies**:
-```bash
-pip install chromadb openai psycopg2-binary
-docker run -d -p 8000:8000 --name chroma chromadb/chroma
-export OPENAI_API_KEY='your-api-key-here'
-```
-
-### Busybox Installation (Critical for QEMU Testing)
-
-The qemu-test skill requires busybox to create minimal initramfs. **For cross-architecture testing, you need architecture-matched busybox.**
-
-#### Native Architecture (Simple Install)
-
-For same-architecture testing (e.g., x86_64 host → x86_64 QEMU):
+### Install MCP Package
 
 ```bash
-# Ubuntu/Debian
-sudo apt install busybox-static
+# Install Python dependencies
+pip install -e .[cli]
 
-# CentOS/RHEL
-sudo yum install busybox
+# Register MCP Server
+claude mcp add aicrasher -- python3 -m aicrasher.mcp_server
 
-# Verify static linking
-ldd /bin/busybox
-# Expected: "not a dynamic executable" (static)
+# Verify registration
+claude mcp list
 ```
 
-#### Cross-Architecture Busybox Compilation
+### Install Skills
 
-For cross-architecture testing (e.g., x86_64 host → ARM64/ARM32 QEMU), compile busybox for target architecture:
-
-**Prerequisites**:
 ```bash
-# Download busybox source
-wget https://busybox.net/downloads/busybox-1.36.1.tar.bz2
-tar -xjf busybox-1.36.1.tar.bz2
-cd busybox-1.36.1
-```
-
-**ARM64 Busybox**:
-```bash
-# Configure for ARM64
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-
-# Enable static compilation
-sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
-
-# Build
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
-
-# Result: busybox (ARM64 static, ~969K)
-file busybox
-# Expected: ELF 64-bit LSB executable, ARM aarch64, version 1 (GNU/Linux), statically linked
-```
-
-**ARM32 Busybox**:
-```bash
-# Configure for ARM32
-make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- defconfig
-
-# Enable static compilation
-sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
-
-# Build
-make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- -j$(nproc)
-
-# Result: busybox (ARM32 static, ~900K)
-file busybox
-# Expected: ELF 32-bit LSB executable, ARM, version 1 (GNU/Linux), statically linked
-```
-
-**Installation for QEMU Testing**:
-```bash
-# Create directory for cross-arch busybox
-mkdir -p ~/.local/share/qemu-busybox
-
-# Copy compiled busybox
-cp busybox ~/.local/share/qemu-busybox/busybox-arm64  # For ARM64
-cp busybox ~/.local/share/qemu-busybox/busybox-arm32  # For ARM32
-
-# Update create_initramfs.sh or use custom busybox path
-# Option 1: Set BUSYBOX_PATH environment variable
-export BUSYBOX_PATH=~/.local/share/qemu-busybox/busybox-arm64
-
-# Option 2: Modify create_initramfs.sh to detect architecture
-```
-
-#### Architecture Compatibility Matrix
-
-| Host Arch | QEMU Arch | Busybox Required | Size |
-|-----------|-----------|------------------|------|
-| x86_64 | x86_64 | x86_64 (native) | ~1.0M |
-| x86_64 | ARM64 | ARM64 (cross-compile) | ~969K |
-| x86_64 | ARM32 | ARM32 (cross-compile) | ~900K |
-| ARM64 | ARM64 | ARM64 (native) | ~969K |
-| ARM32 | ARM32 | ARM32 (native) | ~900K |
-
-#### Common Busybox Issues
-
-**Problem**: x86-64 busybox in ARM64 QEMU
-```
-/modules/jffs2.ko: line 1: ELF...: not found
-insmod: can't insert '/modules/jffs2.ko': exec format error
-```
-
-**Solution**: Compile ARM64 static busybox (see above).
-
-**Problem**: Dynamic-linked busybox missing libraries
-```
-/bin/sh: No such file or directory
-init: exec failed: /bin/sh
-```
-
-**Solution**: Use static-linked busybox (`CONFIG_STATIC=y`).
-
-### Installing Skills
-
-Copy all 6 skill directories to Claude Code skills directory:
-```bash
+# Copy all skills to Claude Code skills directory
 mkdir -p ~/.claude/skills
-cp -r skills/kernel-build ~/.claude/skills/
-cp -r skills/qemu-test ~/.claude/skills/
-cp -r skills/jffs2-analyzer ~/.claude/skills/
-cp -r skills/jffs2-mount ~/.claude/skills/
-cp -r skills/jffs2-fault-inject ~/.claude/skills/
-cp -r skills/rag-case-retrieval ~/.claude/skills/
-```
+cp -r skills/* ~/.claude/skills/
 
-**Verification**:
-```bash
+# Verify installation
 ls ~/.claude/skills/
-# Expected: kernel-build qemu-test jffs2-analyzer jffs2-mount jffs2-fault-inject rag-case-retrieval
 ```
 
 ## Directory Structure
 
 ```
 Analysis-SKILL/
-├── README.md                       # 项目总览
-├── skills/                         # 6个独立技能
-│   ├── kernel-build/SKILL.md       # Skill 1: 内核编译
-│   ├── qemu-test/SKILL.md          # Skill 2: QEMU启动
-│   ├── jffs2-analyzer/SKILL.md     # Skill 3: JFFS2静态分析
-│   ├── jffs2-mount/SKILL.md        # Skill 4: JFFS2挂载测试
-│   ├── jffs2-fault-inject/SKILL.md # Skill 5: 故障注入
-│   └── rag-case-retrieval/SKILL.md # Skill 6: RAG案例检索
-├── docs/                           # 用户文档
-│   ├── VERIFICATION_REPORT.md      # 验证报告（合并ARM32/ARM64）
-│   ├── kernel-build-validation.md  # Kernel Build验证
-│   ├── OPTIMIZATION_HISTORY.md     # 优化历程
-│   ├── TESTING_ISSUES_AND_SOLUTIONS.md  # 测试问题总结
-│   ├── cross_arch_busybox_analysis.md   # 跨架构busybox指南
-│   ├── jffs2-analyzer-guide.md     # JFFS2 Analyzer使用指南
-│   └ rag-case-retrieval-guide.md   # RAG检索使用指南
-└── tools/                          # 辅助工具
+├── README.md                       # Project overview
+├── pyproject.toml                  # Python package config (MCP)
+├── .env.example                    # Environment config template
+├── CLAUDE.md                       # Claude Code guidance
+├── src/
+│   └── aicrasher/                  # MCP Server core
+│       ├── mcp_server.py           # FastMCP server (9 tools)
+│       ├── crash_session.py        # Crash CLI session manager
+│       ├── config.py               # Pydantic config
+│       ├── knowledge_base.py       # KB search
+│       └── ai_orchestrator.py      # OpenAI interaction
+├── skills/                         # 8 skills
+│   ├── vmcore-analyzer/            # NEW: Complete vmcore analysis
+│   │   ├── SKILL.md                # 7-phase workflow
+│   │   └── references/             # Analysis guides
+│   │       ├── phases/             # Phase detail files
+│   │       └── reference/          # Scenario guides
+│   ├── lock-analyzer/              # Updated: MCP-powered lock analysis
+│   │   └── SKILL.md                # Lock analysis workflow
+│   ├── kernel-build/               # Kernel compilation
+│   ├── qemu-test/                  # QEMU testing
+│   ├── jffs2-analyzer/             # JFFS2 static analysis
+│   ├── jffs2-mount/                # JFFS2 mount testing
+│   ├── jffs2-fault-inject/         # Fault injection
+│   └── rag-case-retrieval/         # RAG retrieval
+├── scripts/                        # Helper scripts
+│   ├── crash_report_generator.py   # HTML report generator
+│   ├── setup.sh                    # One-click setup
+│   └── build_busybox.sh            # Cross-arch busybox builder
+├── docs/                           # User documentation
+│   ├── lock-analyzer-guide.md      # Lock analyzer guide
+│   ├── rag-case-retrieval-guide.md # RAG guide
+│   └── jffs2-analyzer-guide.md     # JFFS2 guide
+└── tools/                          # Build tools
+    └── busybox/                    # Busybox binaries
 ```
 
-## 文档说明
+## Workflow Examples
 
-| 文档 | 内容 | 适合人群 |
-|------|------|---------|
-| VERIFICATION_REPORT.md | 端到端验证结果 | 查看测试状态 |
-| kernel-build-validation.md | Kernel Build测试 | 内核编译验证 |
-| OPTIMIZATION_HISTORY.md | Skills版本迭代 | 了解演进历史 |
-| TESTING_ISSUES_AND_SOLUTIONS.md | 问题解决方案 | 排错参考 |
-| cross_arch_busybox_analysis.md | Busybox编译指南 | 跨架构测试 |
-| jffs2-analyzer-guide.md | Analyzer使用指南 | JFFS2分析入门 |
-| rag-case-retrieval-guide.md | RAG检索完整指南 | 案例检索入门 |
-│       ├── scripts/
-## Skill Architecture & Decoupling
-
-All 6 skills are **completely decoupled**:
+### Vmcore Analysis Workflow
 
 ```
-┌───────────────────────────────────────────────────────────────────────────────────┐
-│                             Independent Skills                                     │
-├───────────────────────────────────────────────────────────────────────────────────┤
-│  kernel-build  │ qemu-test    │ jffs2-analyzer │ jffs2-mount │ jffs2-fault-inject│ rag-case-retrieval │
-│  ────────────  │ ──────────   │ ─────────────  │ ──────────  │ ───────────────── │ ──────────────────  │
-│  Compile kernel│ Boot kernel  │ Static analysis│ Mount test  │ Inject faults     │ RAG retrieval       │
-│  Output: Image │ Requires:Img │ Input: jffs2   │ Requires:   │ Input: jffs2      │ Input: query        │
-│  + modules     │ (user prov)  │ Output: report │ Image+kernel│ Output: corrupted │ Output: JSON cases   │
-│                │ Output: logs │                │ (user prov) │ jffs2 + report    │                     │
-│  No calls to:  │ No calls to: │ No calls to:   │ No calls to:│ No calls to:      │ No calls to:        │
-│  other skills  │ kernel-build │ other skills   │ other skills│ other skills      │ other skills        │
-└───────────────────────────────────────────────────────────────────────────────────┘
+# Step 1: Start vmcore analysis
+/vmcore-analyzer /path/to/vmcore /path/to/vmlinux
 
-Users combine skills as needed:
-  Step 1: /kernel-build JFFS2_FS --arch arm64 (optional)
-  Step 2: /jffs2-fault-inject --image test.jffs2 --fault hdr_crc,magic
-  Step 3: /jffs2-analyzer corrupted.jffs2          (independent)
-  Step 4: /jffs2-mount --kernel Image --mount      (independent)
-  Step 5: /qemu-test --kernel Image                (independent)
-  Step 6: python retrieve_cases.py "JWT认证失败"   (independent)
+# The skill will:
+# - Create crash session via MCP
+# - Collect baseline (sys, bt, log)
+# - Identify panic type
+# - Perform deep analysis
+# - Search for fixes (if kernel bug)
+# - Generate HTML report
+# - Close session
 ```
 
-## Key Technical Notes
+### Lock Analysis Workflow
 
-### Critical Lessons from Testing
+```
+# Step 1: Create crash session (or use existing from vmcore-analyzer)
+# Step 2: Analyze specific lock
+/lock-analyzer 0xffffffc00012345 --type mutex
 
-Based on ARM64 end-to-end verification (2026-05-18):
-
-| Lesson | Issue | Solution |
-|--------|-------|----------|
-| **Architecture Matching** | x86-64 busybox fails in ARM64 QEMU | Cross-compile busybox for target arch |
-| **Interactive Config** | `make defconfig` prompts hundreds of options | Use `make allnoconfig` + sed + `yes ""` |
-| **Applet Missing** | Scripts fail: `command not found` | Enable all required applets in busybox |
-| **Tail Options** | `tail -10` doesn't work | Enable `CONFIG_FEATURE_TAIL_USE_F` |
-| **Module Version** | Kernel/module mismatch fails | Compile kernel+modules in same session |
-| **MTD Dependency** | JFFS2 needs MTD device | Setup block2mtd/mtdram before mount |
-
-### Busybox Requirements for QEMU Testing
-
-**Minimum applets checklist** (based on real testing):
-
-| Category | Applets | Purpose |
-|----------|---------|---------|
-| Shell | `sh`, `ash`, `test`, `[` | Script execution |
-| Basic | `cat`, `ls`, `mkdir`, `sleep` | File operations |
-| Mount | `mount`, `umount`, `mknod` | Filesystem |
-| System | `poweroff`, `reboot`, `dmesg` | Control |
-| Modules | `insmod`, `lsmod`, `rmmod` | Kernel modules |
-| Info | `uname`, `grep`, `date` | Information |
-| Logs | `tail` (with features) | Log viewing |
-
-**Automated cross-compilation tool**: `tools/build_busybox.sh`
-
-```bash
-# Build ARM64 busybox with all required applets
-./tools/build_busybox.sh --arch arm64
-
-# Build with custom applets
-./tools/build_busybox.sh --arch arm64 --applets wget,curl,vi
+# Step 3: Check for deadlocks
+/lock-analyzer --deadlock-check
 ```
 
-### Version Matching
+### Kernel Build + QEMU Test Workflow
 
-**Critical**: Kernel and modules must have matching vermagic.
-
-Problem example:
 ```
-Kernel:  X.Y.Z-36583-gabc123-dirty
-Module:  X.Y.Z+ (vermagic mismatch)
-Result:  insmod fails with "invalid module format"
-```
-
-Solution: Build kernel and modules in single session (kernel-build skill does this correctly).
-
-### MTD Dependency for JFFS2
-
-JFFS2 requires MTD subsystem:
-```
-# Load MTD first, then JFFS2
-insmod mtd.ko
-insmod jffs2.ko
-```
-
-### Cross-Architecture Busybox
-
-ARM64 QEMU requires ARM64-compiled busybox:
-```
-# Cross-compile busybox for ARM64
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
-make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- install
-```
-
-Result: ARM64 static busybox (~969K)
-
-## Testing Examples
-
-### JFFS2 Module Test
-
-Build and test JFFS2 filesystem module:
-```bash
-# Build
+# Step 1: Build kernel with JFFS2 module
 /kernel-build JFFS2_FS --arch arm64 --cross
 
-# Test
-/qemu-test --arch arm64 --script tests/jffs2_load.sh
+# Step 2: Test in QEMU
+/qemu-test --arch arm64 --kernel arch/arm64/boot/Image --modules fs/jffs2/jffs2.ko
 ```
 
-Expected output:
+### JFFS2 Analysis Workflow
+
 ```
-✓ mtd.ko loaded
-✓ jffs2.ko loaded successfully
-jffs2 147456 0 - Live 0xffffad6d0ec8a000
-```
+# Step 1: Create test image
+/jffs2-mount --kernel Image --mount-test
 
-### RAG Case Retrieval Test
+# Step 2: Inject faults
+/jffs2-fault-inject --image normal.jffs2 --fault hdr_crc,magic
 
-Import cases and perform semantic retrieval:
-```bash
-# Setup environment
-cd skills/rag-case-retrieval
-python scripts/check_environment.py
-
-# Import cases from JSON
-python scripts/import_cases.py --source json --file test_cases.json --collection cases
-
-# Retrieve similar cases
-python scripts/retrieve_cases.py "JWT认证失败案例" --top-k 3 --min-similarity 0.7
+# Step 3: Analyze corrupted image
+/jffs2-analyzer corrupted.jffs2
 ```
 
-Expected output:
-```json
-{
-  "status": "success",
-  "query": "JWT认证失败案例",
-  "results": [
-    {
-      "id": "case_001",
-      "title": "JWT令牌过期处理不当",
-      "similarity_score": 0.89
-    }
-  ],
-  "summary": {
-    "total_found": 3,
-    "retrieval_time_ms": 245
-  }
-}
+## Skill Architecture
+
 ```
-
-## Documentation
-
-- **skills/kernel-build/SKILL.md**: Complete kernel-build skill definition
-- **skills/qemu-test/SKILL.md**: Complete qemu-test skill definition
-- **skills/jffs2-analyzer/SKILL.md**: JFFS2 static analysis skill
-- **skills/jffs2-mount/SKILL.md**: JFFS2 mount testing skill
-- **skills/jffs2-fault-inject/SKILL.md**: JFFS2 fault injection skill
-- **skills/rag-case-retrieval/SKILL.md**: RAG case retrieval skill
-- **docs/E2E_VERIFICATION_REPORT.md**: ARM64 end-to-end verification report
-- **docs/cross_arch_busybox_analysis.md**: Cross-architecture busybox solution
-- **docs/rag-case-retrieval-guide.md**: Complete RAG retrieval usage guide
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           MCP Server Layer                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  aicrasher MCP Server (src/aicrasher/)                              │    │
+│  │  - 9 crash analysis tools                                           │    │
+│  │  - Session management                                               │    │
+│  │  - Command logging                                                  │    │
+│  │  - Knowledge base                                                   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ▲
+                                    │ MCP Tools
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Skill Layer                                     │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐    │
+│  │ vmcore-       │ │ lock-         │ │ kernel-build  │ │ qemu-test     │    │
+│  │ analyzer      │ │ analyzer      │ │               │ │               │    │
+│  │ ───────────── │ │ ───────────── │ │ ───────────── │ │ ───────────── │    │
+│  │ Uses MCP      │ │ Uses MCP      │ │ Compile       │ │ Boot kernel   │    │
+│  │ Full workflow │ │ Lock focus    │ │ kernel        │ │ in QEMU       │    │
+│  └───────────────┘ └───────────────┘ └───────────────┘ └───────────────┘    │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐    │
+│  │ jffs2-        │ │ jffs2-mount   │ │ jffs2-fault-  │ │ rag-case-     │    │
+│  │ analyzer      │ │               │ │ inject        │ │ retrieval     │    │
+│  │ ───────────── │ │ ───────────── │ │ ───────────── │ │ ───────────── │    │
+│  │ Static        │ │ Mount test    │ │ Fault inject  │ │ RAG search    │    │
+│  │ analysis      │ │ in QEMU       │ │ corruption    │ │ vector DB     │    │
+│  └───────────────┘ └───────────────┘ └───────────────┘ └───────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ## Contributing
 
 To add new skills or improve existing ones:
 1. Create skill directory under `skills/<skill-name>/`
 2. Add SKILL.md with skill definition (frontmatter + content)
-3. Include supporting scripts in `scripts/` subdirectory
+3. Include supporting scripts in `scripts/` subdirectory if needed
 4. Add documentation in `docs/`
 5. Update README.md
 
 ## License
 
-Linux kernel follows GPL v2 license.
-Skills and tools in this repository are provided under MIT license.
-
-## Authors
-
-- Kernel Build Skill: Developed for Linux kernel cross-compilation workflow
-- QEMU Test Skill: Created for kernel verification automation
-- End-to-end validation: Completed 2026-05-18
+- Linux kernel: GPL v2
+- Skills and tools: MIT license
+- MCP Server code: GPL-2.0-only
 
 ## References
 
+- [crash utility](https://github.com/crash-utility/crash) - Linux kernel crash analysis
+- [Model Context Protocol](https://modelcontextprotocol.io/) - AI tool protocol
+- [FastMCP](https://github.com/jlowin/fastmcp) - Python MCP framework
 - Kernel Documentation: Documentation/process/coding-style.rst
 - QEMU Documentation: https://www.qemu.org/docs/
-## Verification Results
-
-### ARM64 End-to-End Test ✅
-
-| Item | Result | Details |
-|------|--------|---------|
-| Kernel | ✅ Pass | Image (37M) |
-| jffs2.ko | ✅ Pass | Module load successful |
-| MTD | ✅ Pass | mtd.ko + jffs2.ko loaded |
-| QEMU Boot | ✅ Pass | Shell entered |
-
-**Test Date**: 2026-05-18
-**Report**: docs/E2E_VERIFICATION_REPORT.md
-
-### ARM32 End-to-End Test ✅
-
-| Item | Result | Details |
-|------|--------|---------|
-| Kernel | ✅ Pass | zImage (11M) |
-| jffs2.ko | ✅ Pass | Module load successful (149K) |
-| MTD | ✅ Pass | Built-in (CONFIG_MTD=y) |
-| QEMU Boot | ✅ Pass | Shell entered |
-
-**Key Difference**: ARM32 MTD is built-in, no need for mtd.ko module.
-**Test Date**: 2026-05-18
-**Report**: docs/ARM32_E2E_REPORT.md
-
-### Architecture Comparison
-
-| Feature | ARM64 | ARM32 |
-|---------|-------|-------|
-| Kernel Image | Image (37M) | zImage (11M) |
-| jffs2.ko Size | 5.9M | 149K |
-| MTD Config | Module (m) | Built-in (y) |
-| Busybox Size | 969K | 2.1M |
-| Toolchain | aarch64-linux-gnu- | arm-linux-gnueabi- |
-
