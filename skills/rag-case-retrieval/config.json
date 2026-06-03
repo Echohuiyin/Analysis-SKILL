@@ -1,0 +1,41 @@
+{
+  "chroma": {
+    "host": "http://localhost:8000",
+    "collection_name": "cases",
+    "timeout": 30,
+    "retry_attempts": 3
+  },
+  "embedding": {
+    "model": "text-embedding-3-small",
+    "batch_size": 100,
+    "max_retries": 3
+  },
+  "retrieval": {
+    "default_top_k": 3,
+    "min_similarity": 0.7,
+    "include_fields": ["id", "title", "content", "metadata"]
+  },
+  "chunking": {
+    "strategy": "semantic",
+    "max_chunk_size": 1000,
+    "overlap": 200,
+    "min_chunk_size": 100
+  },
+  "database": {
+    "type": "postgresql",
+    "host": "localhost",
+    "port": 5432,
+    "database": "cases_db",
+    "user": "your_user",
+    "password": "your_password"
+  },
+  "import_mapping": {
+    "id": "case_id",
+    "title": "case_title",
+    "content": "case_description",
+    "category": "category_name",
+    "tags": "tag_list",
+    "created_at": "created_time"
+  },
+  "import_query": "SELECT * FROM cases WHERE created_at > '2020-01-01'"
+}

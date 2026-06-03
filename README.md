@@ -4,13 +4,14 @@ This repository contains Claude Code skills for kernel compilation, QEMU testing
 
 ## Overview
 
-Five independent and decoupled skills for kernel development workflow:
+Six independent and decoupled skills for kernel development workflow and case retrieval:
 
 - **kernel-build**: Compile Linux kernels with custom configurations
 - **qemu-test**: Boot kernels in QEMU for testing and verification
 - **jffs2-analyzer**: Static analysis of JFFS2 filesystem images
 - **jffs2-mount**: Mount JFFS2 images in QEMU for dynamic verification
 - **jffs2-fault-inject**: Inject faults into JFFS2 images for testing
+- **rag-case-retrieval**: RAG-based semantic case retrieval from vector database
 
 All skills are **completely decoupled** - each skill operates independently without calling or depending on other skills.
 
@@ -163,6 +164,65 @@ Inject various faults into JFFS2 filesystem images for testing kernel fault hand
 
 **Decoupled**: Standalone Python-based fault injection, can be used before jffs2-analyzer or jffs2-mount.
 
+### 6. rag-case-retrieval Skill
+
+**Location**: `skills/rag-case-retrieval/`
+
+RAG-based semantic case retrieval from Chroma vector database.
+
+**Key Features**:
+- Multi-source data import (PostgreSQL, JSON, CSV)
+- Intelligent text chunking (semantic boundaries + overlap)
+- OpenAI Embedding vectorization
+- Chroma vector storage and retrieval
+- Metadata filtering (time, category, tags)
+- Structured JSON output (top-3 cases)
+
+**Prerequisites**:
+- Chroma Docker service running on localhost:8000
+- OpenAI API Key configured
+- Python dependencies: chromadb, openai, psycopg2-binary
+
+**Usage**:
+```
+# Import cases from database
+python skills/rag-case-retrieval/scripts/import_cases.py --source database
+
+# Import from JSON file
+python skills/rag-case-retrieval/scripts/import_cases.py --source json --file cases.json
+
+# Retrieve similar cases
+python skills/rag-case-retrieval/scripts/retrieve_cases.py "JWT认证失败" --top-k 3
+
+# Retrieve with filters
+python skills/rag-case-retrieval/scripts/retrieve_cases.py "性能优化" \
+  --filters '{"category": "性能", "created_at": {"$gte": "2024-01-01"}}'
+```
+
+**Output Format**:
+```json
+{
+  "query": "用户查询",
+  "results": [
+    {
+      "id": "case_001",
+      "title": "案例标题",
+      "content": "案例内容",
+      "similarity_score": 0.85,
+      "metadata": {"category": "安全", "tags": ["JWT"]}
+    }
+  ],
+  "summary": {
+    "total_found": 3,
+    "retrieval_time_ms": 245
+  }
+}
+```
+
+**Documentation**: See `docs/rag-case-retrieval-guide.md` for complete usage guide.
+
+**Decoupled**: Standalone Python-based RAG system, no dependencies on other skills.
+
 **Workflow Integration**: Users can combine skills as needed:
 ```
 # Option 1: Full fault testing workflow
@@ -177,6 +237,11 @@ Inject various faults into JFFS2 filesystem images for testing kernel fault hand
 /jffs2-analyzer image.jffs2              # Just analyze
 /jffs2-fault-inject --image test.jffs2   # Just inject faults
 /jffs2-mount --kernel Image --mount-test # Just mount
+
+# Option 3: RAG case retrieval workflow
+python skills/rag-case-retrieval/scripts/check_environment.py
+python skills/rag-case-retrieval/scripts/import_cases.py --source database
+python skills/rag-case-retrieval/scripts/retrieve_cases.py "查询文本" --top-k 3
 ```
 
 Build the Linux kernel with custom CONFIG options (tested with openEuler kernel).
@@ -254,6 +319,12 @@ Complete build and test cycle:
 - qemu-system-x86_64 (x86_64)
 - ARM64 static busybox for cross-architecture testing
 
+**RAG Retrieval Requirements**:
+- Python 3.8+
+- Chroma Docker service (chromadb/chroma image)
+- OpenAI API Key
+- PostgreSQL client libraries (for database import)
+
 **Cross-Compilation Toolchain** (Ubuntu/Debian):
 ```bash
 sudo apt install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu  # ARM64
@@ -263,6 +334,13 @@ sudo apt install gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi  # ARM32
 **QEMU Installation**:
 ```bash
 sudo apt install qemu-system-arm qemu-system-x86
+```
+
+**RAG Dependencies**:
+```bash
+pip install chromadb openai psycopg2-binary
+docker run -d -p 8000:8000 --name chroma chromadb/chroma
+export OPENAI_API_KEY='your-api-key-here'
 ```
 
 ### Busybox Installation (Critical for QEMU Testing)
@@ -375,19 +453,21 @@ init: exec failed: /bin/sh
 
 ### Installing Skills
 
-Copy all 4 skill directories to Claude Code skills directory:
+Copy all 6 skill directories to Claude Code skills directory:
 ```bash
 mkdir -p ~/.claude/skills
 cp -r skills/kernel-build ~/.claude/skills/
 cp -r skills/qemu-test ~/.claude/skills/
 cp -r skills/jffs2-analyzer ~/.claude/skills/
 cp -r skills/jffs2-mount ~/.claude/skills/
+cp -r skills/jffs2-fault-inject ~/.claude/skills/
+cp -r skills/rag-case-retrieval ~/.claude/skills/
 ```
 
 **Verification**:
 ```bash
 ls ~/.claude/skills/
-# Expected: kernel-build qemu-test jffs2-analyzer jffs2-mount
+# Expected: kernel-build qemu-test jffs2-analyzer jffs2-mount jffs2-fault-inject rag-case-retrieval
 ```
 
 ## Directory Structure
@@ -395,19 +475,21 @@ ls ~/.claude/skills/
 ```
 Analysis-SKILL/
 ├── README.md                       # 项目总览
-├── skills/                         # 5个独立技能
+├── skills/                         # 6个独立技能
 │   ├── kernel-build/SKILL.md       # Skill 1: 内核编译
 │   ├── qemu-test/SKILL.md          # Skill 2: QEMU启动
 │   ├── jffs2-analyzer/SKILL.md     # Skill 3: JFFS2静态分析
 │   ├── jffs2-mount/SKILL.md        # Skill 4: JFFS2挂载测试
-│   └── jffs2-fault-inject/SKILL.md # Skill 5: 故障注入
+│   ├── jffs2-fault-inject/SKILL.md # Skill 5: 故障注入
+│   └── rag-case-retrieval/SKILL.md # Skill 6: RAG案例检索
 ├── docs/                           # 用户文档
 │   ├── VERIFICATION_REPORT.md      # 验证报告（合并ARM32/ARM64）
 │   ├── kernel-build-validation.md  # Kernel Build验证
 │   ├── OPTIMIZATION_HISTORY.md     # 优化历程
 │   ├── TESTING_ISSUES_AND_SOLUTIONS.md  # 测试问题总结
 │   ├── cross_arch_busybox_analysis.md   # 跨架构busybox指南
-│   └── jffs2-analyzer-guide.md     # JFFS2 Analyzer使用指南
+│   ├── jffs2-analyzer-guide.md     # JFFS2 Analyzer使用指南
+│   └ rag-case-retrieval-guide.md   # RAG检索使用指南
 └── tools/                          # 辅助工具
 ```
 
@@ -421,24 +503,25 @@ Analysis-SKILL/
 | TESTING_ISSUES_AND_SOLUTIONS.md | 问题解决方案 | 排错参考 |
 | cross_arch_busybox_analysis.md | Busybox编译指南 | 跨架构测试 |
 | jffs2-analyzer-guide.md | Analyzer使用指南 | JFFS2分析入门 |
+| rag-case-retrieval-guide.md | RAG检索完整指南 | 案例检索入门 |
 │       ├── scripts/
 ## Skill Architecture & Decoupling
 
-All 5 skills are **completely decoupled**:
+All 6 skills are **completely decoupled**:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Independent Skills                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│  kernel-build  │ qemu-test    │ jffs2-analyzer │ jffs2-mount │ jffs2-fault-inject │
-│  ────────────  │ ──────────   │ ─────────────  │ ──────────  │ ─────────────────  │
-│  Compile kernel│ Boot kernel  │ Static analysis│ Mount test  │ Inject faults      │
-│  Output: Image │ Requires:Img │ Input: jffs2   │ Requires:   │ Input: jffs2       │
-│  + modules     │ (user prov)  │ Output: report │ Image+kernel│ Output: corrupted  │
-│                │ Output: logs │                │ (user prov) │ jffs2 + report     │
-│  No calls to:  │ No calls to: │ No calls to:   │ No calls to:│ No calls to:       │
-│  other skills  │ kernel-build │ other skills   │ other skills│ other skills       │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│                             Independent Skills                                     │
+├───────────────────────────────────────────────────────────────────────────────────┤
+│  kernel-build  │ qemu-test    │ jffs2-analyzer │ jffs2-mount │ jffs2-fault-inject│ rag-case-retrieval │
+│  ────────────  │ ──────────   │ ─────────────  │ ──────────  │ ───────────────── │ ──────────────────  │
+│  Compile kernel│ Boot kernel  │ Static analysis│ Mount test  │ Inject faults     │ RAG retrieval       │
+│  Output: Image │ Requires:Img │ Input: jffs2   │ Requires:   │ Input: jffs2      │ Input: query        │
+│  + modules     │ (user prov)  │ Output: report │ Image+kernel│ Output: corrupted │ Output: JSON cases   │
+│                │ Output: logs │                │ (user prov) │ jffs2 + report    │                     │
+│  No calls to:  │ No calls to: │ No calls to:   │ No calls to:│ No calls to:      │ No calls to:        │
+│  other skills  │ kernel-build │ other skills   │ other skills│ other skills      │ other skills        │
+└───────────────────────────────────────────────────────────────────────────────────┘
 
 Users combine skills as needed:
   Step 1: /kernel-build JFFS2_FS --arch arm64 (optional)
@@ -446,6 +529,7 @@ Users combine skills as needed:
   Step 3: /jffs2-analyzer corrupted.jffs2          (independent)
   Step 4: /jffs2-mount --kernel Image --mount      (independent)
   Step 5: /qemu-test --kernel Image                (independent)
+  Step 6: python retrieve_cases.py "JWT认证失败"   (independent)
 ```
 
 ## Key Technical Notes
@@ -541,12 +625,51 @@ Expected output:
 jffs2 147456 0 - Live 0xffffad6d0ec8a000
 ```
 
+### RAG Case Retrieval Test
+
+Import cases and perform semantic retrieval:
+```bash
+# Setup environment
+cd skills/rag-case-retrieval
+python scripts/check_environment.py
+
+# Import cases from JSON
+python scripts/import_cases.py --source json --file test_cases.json --collection cases
+
+# Retrieve similar cases
+python scripts/retrieve_cases.py "JWT认证失败案例" --top-k 3 --min-similarity 0.7
+```
+
+Expected output:
+```json
+{
+  "status": "success",
+  "query": "JWT认证失败案例",
+  "results": [
+    {
+      "id": "case_001",
+      "title": "JWT令牌过期处理不当",
+      "similarity_score": 0.89
+    }
+  ],
+  "summary": {
+    "total_found": 3,
+    "retrieval_time_ms": 245
+  }
+}
+```
+
 ## Documentation
 
 - **skills/kernel-build/SKILL.md**: Complete kernel-build skill definition
 - **skills/qemu-test/SKILL.md**: Complete qemu-test skill definition
+- **skills/jffs2-analyzer/SKILL.md**: JFFS2 static analysis skill
+- **skills/jffs2-mount/SKILL.md**: JFFS2 mount testing skill
+- **skills/jffs2-fault-inject/SKILL.md**: JFFS2 fault injection skill
+- **skills/rag-case-retrieval/SKILL.md**: RAG case retrieval skill
 - **docs/E2E_VERIFICATION_REPORT.md**: ARM64 end-to-end verification report
 - **docs/cross_arch_busybox_analysis.md**: Cross-architecture busybox solution
+- **docs/rag-case-retrieval-guide.md**: Complete RAG retrieval usage guide
 
 ## Contributing
 
