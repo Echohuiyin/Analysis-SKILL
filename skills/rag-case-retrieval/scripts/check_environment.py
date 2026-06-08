@@ -34,14 +34,58 @@ def check_chroma_connection(host="http://localhost:8000", timeout=5):
     except Exception as e:
         return False, f"无法连接Chroma: {str(e)}"
 
-def check_openai_key():
-    """检查OpenAI API Key"""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return False, "未设置OPENAI_API_KEY环境变量"
-    if not api_key.startswith("sk-"):
-        return False, "OPENAI_API_KEY格式可能不正确"
-    return True, "OpenAI API Key已配置"
+def check_embedding_service(config: Dict):
+    """检查本地嵌入服务连接"""
+    from openai import OpenAI
+
+    embedding_config = config.get("embedding", {})
+    base_url = embedding_config.get("base_url", "http://localhost:11434/v1")
+    model = embedding_config.get("model", "bge-small-zh-v1.5")
+    api_key = embedding_config.get("api_key", "not-required")
+    timeout = embedding_config.get("timeout", 30)
+
+    # 测试连接通过生成一个测试嵌入
+    try:
+        client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout
+        )
+
+        response = client.embeddings.create(
+            model=model,
+            input="test"
+        )
+
+        if response.data and len(response.data) > 0:
+            return True, f"本地嵌入服务连接正常 (模型: {model}, 端点: {base_url})"
+        else:
+            return False, f"嵌入服务响应异常: 未返回向量数据"
+
+    except Exception as e:
+        error_msg = str(e)
+        suggestions = []
+
+        if "Connection refused" in error_msg or "connect" in error_msg.lower():
+            suggestions = [
+                "请确保嵌入服务正在运行",
+                f"检查 {base_url} 是否可访问",
+                "如果是Ollama: ollama serve",
+                "如果是text-embeddings-inference: 检查Docker容器状态"
+            ]
+        elif "model" in error_msg.lower() and "not found" in error_msg.lower():
+            suggestions = [
+                f"请拉取模型: ollama pull {model}",
+                f"或修改config.json中的embedding.model为可用模型"
+            ]
+        else:
+            suggestions = [
+                f"检查服务配置: {base_url}",
+                "验证模型名称是否正确",
+                "检查服务日志"
+            ]
+
+        return False, f"无法连接嵌入服务: {error_msg}\n建议:\n" + "\n".join(f"  - {s}" for s in suggestions)
 
 def check_collection(collection_name="cases", host="http://localhost:8000"):
     """检查Collection状态"""
@@ -64,6 +108,22 @@ def main():
     print("RAG案例检索 - 环境检查")
     print("=" * 60)
 
+    # 先读取配置
+    config_path = Path.home() / ".claude" / "skills" / "rag-case-retrieval" / "config.json"
+    config = {}
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+    else:
+        config = {
+            "embedding": {
+                "base_url": "http://localhost:11434/v1",
+                "model": "bge-small-zh-v1.5",
+                "api_key": "not-required",
+                "timeout": 30
+            }
+        }
+
     # 1. 检查依赖
     print("\n[1/4] 检查Python依赖...")
     missing = check_dependencies()
@@ -73,24 +133,18 @@ def main():
         return 1
     print("  ✅ 所有依赖已安装")
 
-    # 2. 检查OpenAI API Key
-    print("\n[2/4] 检查OpenAI配置...")
-    success, msg = check_openai_key()
+    # 2. 检查本地嵌入服务
+    print("\n[2/4] 检查本地嵌入服务...")
+    success, msg = check_embedding_service(config)
     if success:
         print(f"  ✅ {msg}")
     else:
         print(f"  ❌ {msg}")
-        print("  设置命令: export OPENAI_API_KEY='your-api-key'")
         return 1
 
     # 3. 检查Chroma连接
     print("\n[3/4] 检查Chroma服务...")
-    config_path = Path.home() / ".claude" / "skills" / "rag-case-retrieval" / "config.json"
-    host = "http://localhost:8000"
-    if config_path.exists():
-        with open(config_path) as f:
-            config = json.load(f)
-            host = config.get("chroma", {}).get("host", host)
+    host = config.get("chroma", {}).get("host", "http://localhost:8000")
 
     success, msg = check_chroma_connection(host)
     if success:
@@ -102,11 +156,7 @@ def main():
 
     # 4. 检查Collection
     print("\n[4/4] 检查Collection状态...")
-    collection_name = "cases"
-    if config_path.exists():
-        with open(config_path) as f:
-            config = json.load(f)
-            collection_name = config.get("chroma", {}).get("collection_name", collection_name)
+    collection_name = config.get("chroma", {}).get("collection_name", "cases")
 
     success, result = check_collection(collection_name, host)
     if success:

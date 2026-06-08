@@ -10,18 +10,30 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-def get_query_embedding(query: str, model: str = "text-embedding-3-small") -> List[float]:
-    """将查询文本转为向量"""
+def get_query_embedding(query: str, config: Dict) -> List[float]:
+    """将查询文本转为向量 (使用本地OpenAI兼容服务)"""
     from openai import OpenAI
 
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    embedding_config = config.get("embedding", {})
+    base_url = embedding_config.get("base_url", "http://localhost:11434/v1")
+    model = embedding_config.get("model", "bge-small-zh-v1.5")
+    api_key = embedding_config.get("api_key", "not-required")
+    timeout = embedding_config.get("timeout", 30)
 
-    response = client.embeddings.create(
-        model=model,
-        input=query
+    client = OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout
     )
 
-    return response.data[0].embedding
+    try:
+        response = client.embeddings.create(
+            model=model,
+            input=query
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        raise Exception(f"Failed to generate embedding from {base_url}: {str(e)}")
 
 def retrieve_cases(query_embedding: List[float],
                   collection_name: str = "cases",
@@ -147,7 +159,12 @@ def main():
     else:
         config = {
             "chroma": {"host": "http://localhost:8000"},
-            "embedding": {"model": "text-embedding-3-small"},
+            "embedding": {
+                "base_url": "http://localhost:11434/v1",
+                "model": "bge-small-zh-v1.5",
+                "api_key": "not-required",
+                "timeout": 30
+            },
             "retrieval": {"default_top_k": 3, "min_similarity": 0.7}
         }
 
@@ -170,7 +187,7 @@ def main():
     # 生成查询向量
     print("\n生成查询向量...")
     start_embedding = time.time()
-    query_embedding = get_query_embedding(args.query, embedding_model)
+    query_embedding = get_query_embedding(args.query, config)
     embedding_time = time.time() - start_embedding
     print(f"  ✅ 完成 ({embedding_time:.2f}s)")
 

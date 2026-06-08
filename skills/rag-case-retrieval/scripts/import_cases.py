@@ -11,24 +11,36 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-def get_openai_embeddings(texts: List[str], model="text-embedding-3-small") -> List[List[float]]:
-    """使用OpenAI生成文本向量"""
+def get_embeddings(texts: List[str], config: Dict) -> List[List[float]]:
+    """生成文本向量 (使用本地OpenAI兼容服务)"""
     from openai import OpenAI
 
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    embedding_config = config.get("embedding", {})
+    base_url = embedding_config.get("base_url", "http://localhost:11434/v1")
+    model = embedding_config.get("model", "bge-small-zh-v1.5")
+    api_key = embedding_config.get("api_key", "not-required")
+    timeout = embedding_config.get("timeout", 30)
+    batch_size = embedding_config.get("batch_size", 100)
 
-    # 批量处理，避免API限制
-    batch_size = 100
+    client = OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout
+    )
+
     all_embeddings = []
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        response = client.embeddings.create(
-            model=model,
-            input=batch
-        )
-        batch_embeddings = [item.embedding for item in response.data]
-        all_embeddings.extend(batch_embeddings)
+        try:
+            response = client.embeddings.create(
+                model=model,
+                input=batch
+            )
+            batch_embeddings = [item.embedding for item in response.data]
+            all_embeddings.extend(batch_embeddings)
+        except Exception as e:
+            raise Exception(f"Failed to generate embeddings from {base_url}: {str(e)}")
 
     return all_embeddings
 
@@ -138,7 +150,8 @@ def import_from_csv(file_path: str, mapping: Dict) -> List[Dict]:
 
     return cases
 
-def store_to_chroma(cases: List[Dict], collection_name: str = "cases",
+def store_to_chroma(cases: List[Dict], config: Dict,
+                   collection_name: str = "cases",
                    host: str = "http://localhost:8000", chunk_size: int = 1000,
                    overlap: int = 200) -> Dict:
     """将案例存储到Chroma"""
@@ -146,6 +159,8 @@ def store_to_chroma(cases: List[Dict], collection_name: str = "cases",
 
     client = chromadb.HttpClient(host=host.split("://")[1].split(":")[0],
                                   port=int(host.split(":")[-1]))
+
+    embedding_model = config.get("embedding", {}).get("model", "bge-small-zh-v1.5")
 
     # 创建或获取collection
     try:
@@ -155,7 +170,7 @@ def store_to_chroma(cases: List[Dict], collection_name: str = "cases",
             name=collection_name,
             metadata={
                 "description": "案例检索向量库",
-                "embedding_model": "text-embedding-3-small",
+                "embedding_model": embedding_model,
                 "created_at": datetime.now().isoformat()
             }
         )
@@ -190,7 +205,7 @@ def store_to_chroma(cases: List[Dict], collection_name: str = "cases",
 
             # 生成向量
             texts = [chunk["text"] for chunk in chunks]
-            embeddings = get_openai_embeddings(texts)
+            embeddings = get_embeddings(texts, config)
 
             # 准备数据
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
@@ -293,6 +308,7 @@ def main():
     print(f"导入到Chroma ({chroma_host})...")
     stats = store_to_chroma(
         cases,
+        config=config,
         collection_name=args.collection,
         host=chroma_host,
         chunk_size=args.chunk_size,

@@ -6,7 +6,10 @@
     "retry_attempts": 3
   },
   "embedding": {
-    "model": "text-embedding-3-small",
+    "base_url": "http://localhost:11434/v1",
+    "model": "bge-small-zh-v1.5",
+    "api_key": "not-required",
+    "timeout": 30,
     "batch_size": 100,
     "max_retries": 3
   },
