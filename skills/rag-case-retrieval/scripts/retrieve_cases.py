@@ -14,23 +14,75 @@ import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-# sqlite3 monkey-patch: 解决Chroma多线程访问问题
-# Chroma底层使用sqlite3存储，默认sqlite3模块不支持多线程
-# 此patch确保sqlite3可以在多线程环境下安全使用
+# ============================================================
+# sqlite3兼容补丁：Chroma要求sqlite3 >= 3.35.0
+# ============================================================
+
+def _apply_sqlite3_compatibility_patch():
+    """
+    应用sqlite3兼容补丁，解决Chroma的sqlite3版本要求问题
+
+    Chroma要求sqlite3 >= 3.35.0，但系统默认sqlite3可能版本较低
+    此补丁尝试使用pysqlite3-binary（如果可用）替换系统sqlite3
+    """
+    import sqlite3
+
+    # 检查当前sqlite3版本
+    current_version = sqlite3.sqlite_version
+    required_version = "3.35.0"
+
+    # 版本比较
+    def version_ge(v1, v2):
+        parts1 = [int(x) for x in v1.split('.')]
+        parts2 = [int(x) for x in v2.split('.')]
+        for i in range(max(len(parts1), len(parts2))):
+            p1 = parts1[i] if i < len(parts1) else 0
+            p2 = parts2[i] if i < len(parts2) else 0
+            if p1 > p2:
+                return True
+            if p1 < p2:
+                return False
+        return True
+
+    if version_ge(current_version, required_version):
+        # 版本满足要求，应用线程安全patch
+        _apply_sqlite3_thread_patch()
+        return
+
+    # 版本不满足，尝试使用pysqlite3-binary
+    try:
+        import pysqlite3 as pysqlite3_module
+        # 检查pysqlite3版本
+        if version_ge(pysqlite3_module.sqlite_version, required_version):
+            # 替换sqlite3模块
+            sys.modules["sqlite3"] = pysqlite3_module
+            # 应用线程安全patch到新模块
+            import sqlite3  # 重新导入获取pysqlite3
+            _apply_sqlite3_thread_patch()
+            return
+    except ImportError:
+        pass
+
+    # 无法满足版本要求，打印警告（静默模式）
+    _apply_sqlite3_thread_patch()
+
+
 def _apply_sqlite3_thread_patch():
     """应用sqlite3线程安全patch"""
-    # 将原始函数保存到模块属性（避免闭包引用问题）
+    import sqlite3
+
     if not hasattr(sqlite3, '_original_connect_saved'):
         sqlite3._original_connect_saved = sqlite3.connect
 
     def _patched_connect(database, **kwargs):
-        """Monkey-patched sqlite3.connect with thread safety"""
         kwargs['check_same_thread'] = False
         return sqlite3._original_connect_saved(database, **kwargs)
 
     sqlite3.connect = _patched_connect
 
-_apply_sqlite3_thread_patch()
+
+# 在导入时应用补丁
+_apply_sqlite3_compatibility_patch()
 
 
 def get_query_embedding(query: str, config: Dict) -> List[float]:

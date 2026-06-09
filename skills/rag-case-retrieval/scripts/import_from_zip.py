@@ -21,6 +21,79 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
+# ============================================================
+# sqlite3兼容补丁：Chroma要求sqlite3 >= 3.35.0
+# ============================================================
+
+def _apply_sqlite3_compatibility_patch():
+    """
+    应用sqlite3兼容补丁，解决Chroma的sqlite3版本要求问题
+
+    Chroma要求sqlite3 >= 3.35.0，但系统默认sqlite3可能版本较低
+    此补丁尝试使用pysqlite3-binary（如果可用）替换系统sqlite3
+    """
+    import sqlite3
+
+    # 检查当前sqlite3版本
+    current_version = sqlite3.sqlite_version
+    required_version = "3.35.0"
+
+    # 版本比较
+    def version_ge(v1, v2):
+        parts1 = [int(x) for x in v1.split('.')]
+        parts2 = [int(x) for x in v2.split('.')]
+        for i in range(max(len(parts1), len(parts2))):
+            p1 = parts1[i] if i < len(parts1) else 0
+            p2 = parts2[i] if i < len(parts2) else 0
+            if p1 > p2:
+                return True
+            if p1 < p2:
+                return False
+        return True
+
+    if version_ge(current_version, required_version):
+        # 版本满足要求，应用线程安全patch
+        _apply_sqlite3_thread_patch()
+        return
+
+    # 版本不满足，尝试使用pysqlite3-binary
+    try:
+        import pysqlite3 as pysqlite3_module
+        # 检查pysqlite3版本
+        if version_ge(pysqlite3_module.sqlite_version, required_version):
+            # 替换sqlite3模块
+            sys.modules["sqlite3"] = pysqlite3_module
+            print(f"  ℹ️ 使用pysqlite3 (版本 {pysqlite3_module.sqlite_version}) 替换系统sqlite3")
+            # 应用线程安全patch到新模块
+            import sqlite3  # 重新导入获取pysqlite3
+            _apply_sqlite3_thread_patch()
+            return
+    except ImportError:
+        pass
+
+    # 无法满足版本要求，打印警告
+    print(f"  ⚠️ sqlite3版本 {current_version} < {required_version}，Chroma可能无法正常工作")
+    print(f"  建议: pip install pysqlite3-binary")
+    _apply_sqlite3_thread_patch()
+
+
+def _apply_sqlite3_thread_patch():
+    """应用sqlite3线程安全patch"""
+    import sqlite3
+
+    if not hasattr(sqlite3, '_original_connect_saved'):
+        sqlite3._original_connect_saved = sqlite3.connect
+
+    def _patched_connect(database, **kwargs):
+        kwargs['check_same_thread'] = False
+        return sqlite3._original_connect_saved(database, **kwargs)
+
+    sqlite3.connect = _patched_connect
+
+
+# 在导入时应用补丁
+_apply_sqlite3_compatibility_patch()
+
 
 # ============================================================
 # 标题和内容处理（保持原有逻辑）
@@ -138,9 +211,13 @@ def extract_markdown_from_zip_stream(zf: zipfile.ZipFile, member_path: str,
         metadata['source_zip'] = source_zip
         metadata['source_path'] = member_path
 
-        # 生成唯一ID（基于路径hash）
-        path_hash = hashlib.md5(member_path.encode()).hexdigest()[:8]
-        case_id = re.sub(r'[^\w]', '_', member_path.replace('.md', '')) + f"_{path_hash}"
+        # 生成唯一ID（基于来源ZIP+路径hash，消除跨ZIP冲突）
+        # 使用source_zip路径+member_path组合生成hash
+        unique_key = f"{source_zip}:{member_path}"
+        full_hash = hashlib.md5(unique_key.encode()).hexdigest()[:12]
+        # ID格式: sanitized_path + hash（包含ZIP来源信息）
+        path_sanitized = re.sub(r'[^\w]', '_', member_path.replace('.md', ''))[:50]
+        case_id = f"{path_sanitized}_{full_hash}"
 
         return {
             "id": case_id,

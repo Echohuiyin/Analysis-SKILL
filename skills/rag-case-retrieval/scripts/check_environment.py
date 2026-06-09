@@ -6,8 +6,80 @@
 import os
 import sys
 import json
+import sqlite3
 from pathlib import Path
 from typing import Dict
+
+# ============================================================
+# sqlite3兼容补丁：Chroma要求sqlite3 >= 3.35.0
+# ============================================================
+
+def _apply_sqlite3_compatibility_patch():
+    """
+    应用sqlite3兼容补丁，解决Chroma的sqlite3版本要求问题
+
+    Chroma要求sqlite3 >= 3.35.0，但系统默认sqlite3可能版本较低
+    此补丁尝试使用pysqlite3-binary（如果可用）替换系统sqlite3
+    """
+    import sqlite3
+
+    # 检查当前sqlite3版本
+    current_version = sqlite3.sqlite_version
+    required_version = "3.35.0"
+
+    # 版本比较
+    def version_ge(v1, v2):
+        parts1 = [int(x) for x in v1.split('.')]
+        parts2 = [int(x) for x in v2.split('.')]
+        for i in range(max(len(parts1), len(parts2))):
+            p1 = parts1[i] if i < len(parts1) else 0
+            p2 = parts2[i] if i < len(parts2) else 0
+            if p1 > p2:
+                return True
+            if p1 < p2:
+                return False
+        return True
+
+    if version_ge(current_version, required_version):
+        # 版本满足要求，应用线程安全patch
+        _apply_sqlite3_thread_patch()
+        return True, current_version
+
+    # 版本不满足，尝试使用pysqlite3-binary
+    try:
+        import pysqlite3 as pysqlite3_module
+        # 检查pysqlite3版本
+        if version_ge(pysqlite3_module.sqlite_version, required_version):
+            # 替换sqlite3模块
+            sys.modules["sqlite3"] = pysqlite3_module
+            # 应用线程安全patch到新模块
+            import sqlite3  # 重新导入获取pysqlite3
+            _apply_sqlite3_thread_patch()
+            return True, pysqlite3_module.sqlite_version
+    except ImportError:
+        pass
+
+    # 无法满足版本要求，返回False
+    _apply_sqlite3_thread_patch()
+    return False, current_version
+
+
+def _apply_sqlite3_thread_patch():
+    """应用sqlite3线程安全patch"""
+    import sqlite3
+
+    if not hasattr(sqlite3, '_original_connect_saved'):
+        sqlite3._original_connect_saved = sqlite3.connect
+
+    def _patched_connect(database, **kwargs):
+        kwargs['check_same_thread'] = False
+        return sqlite3._original_connect_saved(database, **kwargs)
+
+    sqlite3.connect = _patched_connect
+
+
+# 在导入时应用补丁
+_sqlite3_ok, _sqlite3_version = _apply_sqlite3_compatibility_patch()
 
 def check_dependencies():
     """检查Python依赖"""
@@ -114,6 +186,13 @@ def main():
     print("=" * 60)
     print("RAG案例检索 - 环境检查")
     print("=" * 60)
+
+    # 显示sqlite3版本信息（使用全局变量）
+    global _sqlite3_ok, _sqlite3_version
+    if _sqlite3_ok:
+        print(f"sqlite3版本: {_sqlite3_version} ✅ (满足Chroma >= 3.35.0要求)")
+    else:
+        print(f"sqlite3版本: {_sqlite3_version} ⚠️ (低于3.35.0，建议安装pysqlite3-binary)")
 
     # 先读取配置
     config_path = Path.home() / ".claude" / "skills" / "rag-case-retrieval" / "config.json"
