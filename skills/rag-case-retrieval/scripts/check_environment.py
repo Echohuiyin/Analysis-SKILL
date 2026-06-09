@@ -7,6 +7,7 @@ import os
 import sys
 import json
 from pathlib import Path
+from typing import Dict
 
 def check_dependencies():
     """检查Python依赖"""
@@ -35,12 +36,12 @@ def check_chroma_connection(host="http://localhost:8000", timeout=5):
         return False, f"无法连接Chroma: {str(e)}"
 
 def check_embedding_service(config: Dict):
-    """检查本地嵌入服务连接"""
+    """检查嵌入服务连接"""
     from openai import OpenAI
 
     embedding_config = config.get("embedding", {})
     base_url = embedding_config.get("base_url", "http://localhost:11434/v1")
-    model = embedding_config.get("model", "bge-small-zh-v1.5")
+    model = embedding_config.get("model", "bge-large-zh")
     api_key = embedding_config.get("api_key", "not-required")
     timeout = embedding_config.get("timeout", 30)
 
@@ -58,7 +59,8 @@ def check_embedding_service(config: Dict):
         )
 
         if response.data and len(response.data) > 0:
-            return True, f"本地嵌入服务连接正常 (模型: {model}, 端点: {base_url})"
+            embedding_dim = len(response.data[0].embedding)
+            return True, f"嵌入服务连接正常 (模型: {model}, 维度: {embedding_dim}, 端点: {base_url})"
         else:
             return False, f"嵌入服务响应异常: 未返回向量数据"
 
@@ -91,14 +93,19 @@ def check_collection(collection_name="cases", host="http://localhost:8000"):
     """检查Collection状态"""
     try:
         import chromadb
-        client = chromadb.HttpClient(host=host.split("://://")[1].split(":")[0],
+        client = chromadb.HttpClient(host=host.split("://")[1].split(":")[0],
                                      port=int(host.split(":")[-1]))
         collection = client.get_collection(name=collection_name)
         count = collection.count()
+        metadata = collection.metadata or {}
         return True, {
             "name": collection_name,
             "count": count,
-            "metadata": collection.metadata
+            "metadata": metadata,
+            "distance_metric": metadata.get("hnsw:space", "unknown"),
+            "embedding_model": metadata.get("embedding_model", "unknown"),
+            "embedding_dimension": metadata.get("embedding_dimension", "unknown"),
+            "vectorization_strategy": metadata.get("vectorization_strategy", "unknown")
         }
     except Exception as e:
         return False, str(e)
@@ -114,15 +121,30 @@ def main():
     if config_path.exists():
         with open(config_path) as f:
             config = json.load(f)
+        print(f"配置文件: {config_path}")
     else:
         config = {
             "embedding": {
                 "base_url": "http://localhost:11434/v1",
-                "model": "bge-small-zh-v1.5",
+                "model": "bge-large-zh",
                 "api_key": "not-required",
-                "timeout": 30
+                "timeout": 30,
+                "dimension": 1024
+            },
+            "vectorization": {
+                "head_chars": 400,
+                "title_injection": True
             }
         }
+        print("配置文件: 未找到，使用默认配置")
+
+    # 显示配置信息
+    embedding_config = config.get("embedding", {})
+    vec_config = config.get("vectorization", {})
+    print(f"\n当前配置:")
+    print(f"  嵌入模型: {embedding_config.get('model', 'bge-large-zh')}")
+    print(f"  向量维度: {embedding_config.get('dimension', 1024)}")
+    print(f"  向量化策略: 定长 (头{vec_config.get('head_chars', 400)}字符 + 标题注入)")
 
     # 1. 检查依赖
     print("\n[1/4] 检查Python依赖...")
@@ -133,8 +155,8 @@ def main():
         return 1
     print("  ✅ 所有依赖已安装")
 
-    # 2. 检查本地嵌入服务
-    print("\n[2/4] 检查本地嵌入服务...")
+    # 2. 检查嵌入服务
+    print("\n[2/4] 检查嵌入服务...")
     success, msg = check_embedding_service(config)
     if success:
         print(f"  ✅ {msg}")
@@ -162,8 +184,10 @@ def main():
     if success:
         print(f"  ✅ Collection '{result['name']}' 存在")
         print(f"     - 文档数量: {result['count']}")
-        if result.get('metadata'):
-            print(f"     - 元数据: {result['metadata']}")
+        print(f"     - 距离度量: {result.get('distance_metric', 'cosine')}")
+        print(f"     - 嵌入模型: {result.get('embedding_model', 'unknown')}")
+        print(f"     - 向量维度: {result.get('embedding_dimension', 'unknown')}")
+        print(f"     - 向量化策略: {result.get('vectorization_strategy', 'unknown')}")
     else:
         print(f"  ⚠️  Collection '{collection_name}' 不存在或为空")
         print("     需要先导入案例数据")

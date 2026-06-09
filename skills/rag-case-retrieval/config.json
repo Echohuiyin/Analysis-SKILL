@@ -7,22 +7,24 @@
   },
   "embedding": {
     "base_url": "http://localhost:11434/v1",
-    "model": "bge-small-zh-v1.5",
+    "model": "bge-large-zh",
     "api_key": "not-required",
     "timeout": 30,
     "batch_size": 100,
-    "max_retries": 3
+    "max_retries": 3,
+    "dimension": 1024,
+    "max_tokens": 512
   },
   "retrieval": {
     "default_top_k": 3,
     "min_similarity": 0.7,
+    "distance_metric": "cosine",
     "include_fields": ["id", "title", "content", "metadata"]
   },
-  "chunking": {
-    "strategy": "semantic",
-    "max_chunk_size": 1000,
-    "overlap": 200,
-    "min_chunk_size": 100
+  "vectorization": {
+    "strategy": "fixed_length",
+    "head_chars": 400,
+    "title_injection": true
   },
   "database": {
     "type": "postgresql",

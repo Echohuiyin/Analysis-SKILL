@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 案例导入脚本 - 从数据源导入案例到Chroma向量库
+支持定长向量化策略：每篇案例1个向量（头400字符+标题注入）
 """
 
 import os
@@ -17,7 +18,7 @@ def get_embeddings(texts: List[str], config: Dict) -> List[List[float]]:
 
     embedding_config = config.get("embedding", {})
     base_url = embedding_config.get("base_url", "http://localhost:11434/v1")
-    model = embedding_config.get("model", "bge-small-zh-v1.5")
+    model = embedding_config.get("model", "bge-large-zh")
     api_key = embedding_config.get("api_key", "not-required")
     timeout = embedding_config.get("timeout", 30)
     batch_size = embedding_config.get("batch_size", 100)
@@ -44,38 +45,35 @@ def get_embeddings(texts: List[str], config: Dict) -> List[List[float]]:
 
     return all_embeddings
 
-def chunk_text(text: str, max_size: int = 1000, overlap: int = 200) -> List[Dict[str, Any]]:
-    """将长文本分块"""
-    if len(text) <= max_size:
-        return [{"text": text, "index": 0}]
+def prepare_fixed_length_text(title: str, content: str, config: Dict) -> str:
+    """
+    准备定长文本用于向量化
+    策略：标题注入 + 头400字符
 
-    chunks = []
-    start = 0
-    chunk_index = 0
+    Args:
+        title: 案例标题
+        content: 案例内容
+        config: 配置字典
 
-    while start < len(text):
-        end = start + max_size
+    Returns:
+        定长文本
+    """
+    vec_config = config.get("vectorization", {})
+    head_chars = vec_config.get("head_chars", 400)
+    title_injection = vec_config.get("title_injection", True)
 
-        # 尝试在句子边界分块
-        if end < len(text):
-            # 向后查找句子结束符
-            for sep in ['。', '！', '？', '.', '!', '?', '\n']:
-                last_sep = text.rfind(sep, start, end)
-                if last_sep > start + max_size // 2:
-                    end = last_sep + 1
-                    break
+    # 清理文本
+    title = title.strip() if title else ""
+    content = content.strip() if content else ""
 
-        chunk_text = text[start:end].strip()
-        if chunk_text:
-            chunks.append({
-                "text": chunk_text,
-                "index": chunk_index
-            })
-            chunk_index += 1
+    # 构建向量文本
+    if title_injection and title:
+        # 标题注入格式: "标题\n\n内容前N字符"
+        text = f"{title}\n\n{content[:head_chars]}"
+    else:
+        text = content[:head_chars]
 
-        start = end - overlap if end < len(text) else end
-
-    return chunks
+    return text
 
 def import_from_database(connection_config: Dict, query: str, mapping: Dict) -> List[Dict]:
     """从数据库导入案例"""
@@ -152,40 +150,55 @@ def import_from_csv(file_path: str, mapping: Dict) -> List[Dict]:
 
 def store_to_chroma(cases: List[Dict], config: Dict,
                    collection_name: str = "cases",
-                   host: str = "http://localhost:8000", chunk_size: int = 1000,
-                   overlap: int = 200) -> Dict:
-    """将案例存储到Chroma"""
+                   host: str = "http://localhost:8000") -> Dict:
+    """
+    将案例存储到Chroma（定长向量化，每篇案例1个向量）
+
+    Args:
+        cases: 案例列表
+        config: 配置字典
+        collection_name: Collection名称
+        host: Chroma服务地址
+
+    Returns:
+        统计信息
+    """
     import chromadb
 
     client = chromadb.HttpClient(host=host.split("://")[1].split(":")[0],
                                   port=int(host.split(":")[-1]))
 
-    embedding_model = config.get("embedding", {}).get("model", "bge-small-zh-v1.5")
+    embedding_model = config.get("embedding", {}).get("model", "bge-large-zh")
+    embedding_dimension = config.get("embedding", {}).get("dimension", 1024)
 
-    # 创建或获取collection
+    # 创建或获取collection（使用cosine距离）
     try:
         collection = client.get_collection(name=collection_name)
+        print(f"  使用已有Collection: {collection_name}")
     except:
         collection = client.create_collection(
             name=collection_name,
             metadata={
+                "hnsw:space": "cosine",
                 "description": "案例检索向量库",
                 "embedding_model": embedding_model,
+                "embedding_dimension": embedding_dimension,
+                "vectorization_strategy": "fixed_length",
                 "created_at": datetime.now().isoformat()
             }
         )
+        print(f"  创建新Collection: {collection_name} (cosine距离)")
 
     stats = {
         "total_cases": len(cases),
-        "total_chunks": 0,
         "successful": 0,
         "failed": 0,
         "errors": []
     }
 
-    # 处理每个案例
+    # 准备批量数据
     all_ids = []
-    all_embeddings = []
+    all_texts = []
     all_metadatas = []
     all_documents = []
 
@@ -196,40 +209,36 @@ def store_to_chroma(cases: List[Dict], config: Dict,
                 stats["failed"] += 1
                 stats["errors"].append({
                     "case_id": case.get("id", "unknown"),
-                    "error": "Missing required fields"
+                    "error": "Missing required fields (id or content)"
                 })
                 continue
 
-            # 分块
-            chunks = chunk_text(case["content"], chunk_size, overlap)
+            # 准备定长文本
+            vector_text = prepare_fixed_length_text(
+                case.get("title", ""),
+                case.get("content", ""),
+                config
+            )
 
-            # 生成向量
-            texts = [chunk["text"] for chunk in chunks]
-            embeddings = get_embeddings(texts, config)
+            # 构建元数据
+            metadata = {
+                "doc_id": case["id"],
+                "title": case.get("title", "")[:500],  # 限制元数据长度
+                "content_length": len(case.get("content", "")),
+                "vector_strategy": "fixed_length"
+            }
 
-            # 准备数据
-            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-                chunk_id = f"{case['id']}_chunk_{i}"
+            # 添加额外元数据
+            if "metadata" in case:
+                for key, value in case["metadata"].items():
+                    if isinstance(value, (str, int, float, bool)):
+                        metadata[key] = value
 
-                metadata = {
-                    "doc_id": case["id"],
-                    "title": case.get("title", ""),
-                    "chunk_index": i,
-                    "chunk_total": len(chunks)
-                }
+            all_ids.append(case["id"])
+            all_texts.append(vector_text)
+            all_metadatas.append(metadata)
+            all_documents.append(case.get("content", "")[:2000])  # 存储原始内容预览
 
-                # 添加额外元数据
-                if "metadata" in case:
-                    for key, value in case["metadata"].items():
-                        if isinstance(value, (str, int, float, bool)):
-                            metadata[key] = value
-
-                all_ids.append(chunk_id)
-                all_embeddings.append(embedding)
-                all_metadatas.append(metadata)
-                all_documents.append(chunk["text"])
-
-            stats["total_chunks"] += len(chunks)
             stats["successful"] += 1
 
         except Exception as e:
@@ -239,8 +248,18 @@ def store_to_chroma(cases: List[Dict], config: Dict,
                 "error": str(e)
             })
 
-    # 批量添加到Chroma
-    if all_ids:
+    # 批量生成向量
+    if all_texts:
+        print(f"  生成向量中... ({len(all_texts)} 条案例)")
+        try:
+            all_embeddings = get_embeddings(all_texts, config)
+        except Exception as e:
+            print(f"  ❌ 向量生成失败: {str(e)}")
+            stats["errors"].append({"error": f"Embedding failed: {str(e)}"})
+            return stats
+
+        # 批量添加到Chroma
+        print(f"  存储到Chroma...")
         batch_size = 100
         for i in range(0, len(all_ids), batch_size):
             collection.add(
@@ -256,13 +275,25 @@ def main():
     """主函数 - 从命令行或配置文件读取参数"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="导入案例到Chroma向量库")
+    parser = argparse.ArgumentParser(
+        description="导入案例到Chroma向量库（定长向量化策略）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  %(prog)s --source json --file cases.json
+  %(prog)s --source csv --file cases.csv
+  %(prog)s --source database --config config.json
+
+向量策略:
+  每篇案例生成1个向量，包含：标题注入 + 内容前400字符
+  默认模型: bge-large-zh (1024维)
+  距离度量: cosine
+        """
+    )
     parser.add_argument("--source", help="数据源类型: database, json, csv")
     parser.add_argument("--file", help="JSON或CSV文件路径")
     parser.add_argument("--config", help="配置文件路径")
     parser.add_argument("--collection", default="cases", help="Collection名称")
-    parser.add_argument("--chunk-size", type=int, default=1000, help="分块大小")
-    parser.add_argument("--overlap", type=int, default=200, help="分块重叠")
 
     args = parser.parse_args()
 
@@ -280,11 +311,23 @@ def main():
             print("❌ 未找到配置文件，请使用--config参数或创建默认配置")
             return 1
 
+    # 打印配置信息
+    print("=" * 60)
+    print("案例导入 - 定长向量化策略")
+    print("=" * 60)
+    embedding_config = config.get("embedding", {})
+    vec_config = config.get("vectorization", {})
+    print(f"嵌入模型: {embedding_config.get('model', 'bge-large-zh')}")
+    print(f"向量维度: {embedding_config.get('dimension', 1024)}")
+    print(f"距离度量: cosine")
+    print(f"向量化策略: 定长 (头{vec_config.get('head_chars', 400)}字符 + 标题注入)")
+    print("=" * 60)
+
     # 读取案例
     cases = []
 
     if args.source == "json" and args.file:
-        print(f"从JSON文件导入: {args.file}")
+        print(f"\n从JSON文件导入: {args.file}")
         cases = import_from_json(args.file)
     elif args.source == "csv" and args.file:
         print(f"从CSV文件导入: {args.file}")
@@ -298,34 +341,41 @@ def main():
         cases = import_from_database(db_config, query, mapping)
     else:
         print("❌ 请指定数据源类型和文件路径")
+        print("   示例: --source json --file cases.json")
         return 1
 
     print(f"读取到 {len(cases)} 条案例")
 
+    if not cases:
+        print("❌ 没有读取到任何案例")
+        return 1
+
     # 存储到Chroma
     chroma_host = config.get("chroma", {}).get("host", "http://localhost:8000")
 
-    print(f"导入到Chroma ({chroma_host})...")
+    print(f"\n导入到Chroma ({chroma_host})...")
+    start_time = time.time()
     stats = store_to_chroma(
         cases,
         config=config,
         collection_name=args.collection,
-        host=chroma_host,
-        chunk_size=args.chunk_size,
-        overlap=args.overlap
+        host=chroma_host
     )
+    elapsed = time.time() - start_time
 
     # 输出统计
-    print("\n导入完成:")
+    print("\n" + "=" * 60)
+    print("导入完成:")
     print(f"  ✅ 成功: {stats['successful']}")
     print(f"  ❌ 失败: {stats['failed']}")
-    print(f"  📦 总块数: {stats['total_chunks']}")
+    print(f"  ⏱️  耗时: {elapsed:.2f}s")
 
     if stats['errors']:
         print(f"\n错误详情 ({len(stats['errors'])} 条):")
         for error in stats['errors'][:5]:  # 只显示前5个
-            print(f"  - {error['case_id']}: {error['error']}")
+            print(f"  - {error.get('case_id', 'unknown')}: {error.get('error', 'unknown')}")
 
+    print("=" * 60)
     return 0
 
 if __name__ == "__main__":
