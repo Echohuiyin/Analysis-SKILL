@@ -38,28 +38,47 @@ esac
 echo "CLI Tool: $CLI (or default)"
 echo "Skills Directory: $SKILLS_DIR"
 
-# Step 1: Install MCP Python package
+# Get project directory (where this script is located)
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="$PROJECT_DIR/.venv"
+
+# Step 1: Create and activate virtual environment
 echo ""
-echo "[1/3] Installing MCP Python package..."
-if command -v pip &> /dev/null; then
-    pip install -e .[cli] --quiet
-    echo "✓ MCP package installed"
-else
-    echo "✗ pip not found, skipping MCP installation"
+echo "[1/3] Creating virtual environment and installing MCP Python package..."
+
+if [ ! -d "$VENV_DIR" ]; then
+    python3 -m venv "$VENV_DIR"
+    echo "✓ Virtual environment created at $VENV_DIR"
 fi
+
+# Activate venv
+source "$VENV_DIR/bin/activate"
+
+# Install package
+pip install -e "$PROJECT_DIR[cli]" --quiet
+echo "✓ MCP package installed in virtual environment"
+
+# Deactivate venv
+deactivate
 
 # Step 2: Register MCP Server
 echo ""
 echo "[2/3] Registering MCP Server..."
+
+MCP_CMD="$VENV_DIR/bin/python -m aicrasher.mcp_server"
+
 if [ "$CLI" = "claude" ]; then
-    claude mcp add aicrasher -- python3 -m aicrasher.mcp_server 2>/dev/null || true
+    # Remove existing registration if present, then add new one
+    claude mcp remove aicrasher 2>/dev/null || true
+    claude mcp add aicrasher -- "$MCP_CMD"
     echo "✓ MCP Server registered (aicrasher)"
 elif [ "$CLI" = "codebuddy" ]; then
-    codebuddy mcp add -s user aicrasher -- python3 -m aicrasher.mcp_server 2>/dev/null || true
+    codebuddy mcp remove -s user aicrasher 2>/dev/null || true
+    codebuddy mcp add -s user aicrasher -- "$MCP_CMD"
     echo "✓ MCP Server registered (aicrasher)"
 else
     echo "⊗ Manual registration required:"
-    echo "  claude mcp add aicrasher -- python3 -m aicrasher.mcp_server"
+    echo "  claude mcp add aicrasher -- $MCP_CMD"
 fi
 
 # Step 3: Install Skills
@@ -71,11 +90,19 @@ SKILLS=("vmcore-analyzer" "lock-analyzer" "kernel-build" "qemu-test"
         "jffs2-analyzer" "jffs2-mount" "jffs2-fault-inject" "rag-case-retrieval")
 
 for skill in "${SKILLS[@]}"; do
-    if [ -d "skills/$skill" ]; then
-        cp -r "skills/$skill" "$SKILLS_DIR/"
+    if [ -d "$PROJECT_DIR/skills/$skill" ]; then
+        # Remove old version if exists
+        rm -rf "$SKILLS_DIR/$skill" 2>/dev/null || true
+        cp -r "$PROJECT_DIR/skills/$skill" "$SKILLS_DIR/"
         echo "✓ $skill installed"
     fi
 done
+
+# Create .env if not exists
+if [ ! -f "$PROJECT_DIR/.env" ]; then
+    cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
+    echo "✓ .env created from .env.example"
+fi
 
 # Summary
 echo ""
@@ -83,6 +110,7 @@ echo "=== Installation Complete ==="
 echo ""
 echo "Installed Skills: 8"
 echo "MCP Server: aicrasher"
+echo "Virtual Environment: $VENV_DIR"
 echo ""
 echo "Quick Start:"
 echo "  /vmcore-analyzer <vmcore> <vmlinux>"
@@ -95,5 +123,5 @@ echo ""
 # Verify MCP
 if [ "$CLI" = "claude" ]; then
     echo "Verify MCP:"
-    claude mcp list | grep aicrasher && echo "✓ MCP connected" || echo "⊗ Restart Claude to connect MCP"
+    claude mcp list | grep aicrasher && echo "✓ MCP registered" || echo "⊗ Check MCP registration"
 fi
