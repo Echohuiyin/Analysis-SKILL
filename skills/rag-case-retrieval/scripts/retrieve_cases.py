@@ -10,8 +10,23 @@ import os
 import sys
 import json
 import time
+import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+
+# sqlite3 monkey-patch: 解决Chroma多线程访问问题
+# Chroma底层使用sqlite3存储，默认sqlite3模块不支持多线程
+# 此patch确保sqlite3可以在多线程环境下安全使用
+_original_connect = sqlite3.connect
+
+def _patched_connect(*args, **kwargs):
+    """Monkey-patched sqlite3.connect with thread safety"""
+    # 禁用check_same_thread参数的限制
+    kwargs['check_same_thread'] = False
+    return _original_connect(*args, **kwargs)
+
+sqlite3.connect = _patched_connect
+
 
 def get_query_embedding(query: str, config: Dict) -> List[float]:
     """将查询文本转为向量 (使用本地OpenAI兼容服务)"""

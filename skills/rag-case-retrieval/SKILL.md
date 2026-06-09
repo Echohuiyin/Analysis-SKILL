@@ -132,24 +132,28 @@ python scripts/import_cases.py --source csv --file cases.csv
 python scripts/import_cases.py --source database --config config.json
 ```
 
-**ZIP包导入（递归解压Markdown）**:
+**ZIP包导入（高性能版）**:
 ```bash
 # 单个ZIP文件
 python scripts/import_from_zip.py --zip cases.zip
 
-# 多个ZIP文件
+# 多个ZIP文件（并行处理）
 python scripts/import_from_zip.py --zip archive1.zip archive2.zip
 
-# 自定义Collection
-python scripts/import_from_zip.py --zip docs.zip --collection knowledge_base
+# 自定义Collection和批量大小
+python scripts/import_from_zip.py --zip docs.zip --collection knowledge_base --batch-size 500
 ```
 
-ZIP导入特性：
-- 递归解压嵌套ZIP（最大深度10层）
-- 自动提取所有.md文件
-- Wiki文件名转换为标题（优先级最高）
-- 解析frontmatter元数据
-- 清理Markdown格式标记
+ZIP导入性能优化：
+- **内存流处理**: 直接从ZIP内存流读取，避免磁盘IO
+- **并行向量化**: 多线程批量生成向量
+- **流式写入**: 批量写入Chroma，减少网络请求
+- **sqlite3 monkey-patch**: 解决Chroma多线程安全问题
+
+Wiki文件名标题提取：
+- `001-introduction.md` → `Introduction`
+- `kernel_crash_analysis.md` → `Kernel Crash Analysis`
+- `第1章_概述.md` → `概述`
 
 **向量化处理**：
 1. 读取案例数据
