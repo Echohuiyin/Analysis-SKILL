@@ -283,10 +283,20 @@ def apply_sqlite3_monkey_patch():
     应用sqlite3 monkey-patch解决Chroma线程安全问题
 
     Chroma底层使用sqlite3，多线程环境下需要此patch
+    正确实现：将原始connect保存到模块属性，然后替换为patched版本
     """
     import sqlite3
-    # Monkey-patch: 让sqlite3模块可以被多线程访问
-    sqlite3.sqlite3 = sqlite3
+
+    # 保存原始函数到模块属性（避免闭包引用问题）
+    if not hasattr(sqlite3, '_original_connect_saved'):
+        sqlite3._original_connect_saved = sqlite3.connect
+
+    def _patched_connect(database, **kwargs):
+        """Monkey-patched sqlite3.connect with thread safety"""
+        kwargs['check_same_thread'] = False
+        return sqlite3._original_connect_saved(database, **kwargs)
+
+    sqlite3.connect = _patched_connect
 
 
 def prepare_fixed_length_text(title: str, content: str, config: Dict) -> str:

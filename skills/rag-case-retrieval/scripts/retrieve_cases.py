@@ -17,15 +17,20 @@ from typing import List, Dict, Any, Optional
 # sqlite3 monkey-patch: 解决Chroma多线程访问问题
 # Chroma底层使用sqlite3存储，默认sqlite3模块不支持多线程
 # 此patch确保sqlite3可以在多线程环境下安全使用
-_original_connect = sqlite3.connect
+def _apply_sqlite3_thread_patch():
+    """应用sqlite3线程安全patch"""
+    # 将原始函数保存到模块属性（避免闭包引用问题）
+    if not hasattr(sqlite3, '_original_connect_saved'):
+        sqlite3._original_connect_saved = sqlite3.connect
 
-def _patched_connect(*args, **kwargs):
-    """Monkey-patched sqlite3.connect with thread safety"""
-    # 禁用check_same_thread参数的限制
-    kwargs['check_same_thread'] = False
-    return _original_connect(*args, **kwargs)
+    def _patched_connect(database, **kwargs):
+        """Monkey-patched sqlite3.connect with thread safety"""
+        kwargs['check_same_thread'] = False
+        return sqlite3._original_connect_saved(database, **kwargs)
 
-sqlite3.connect = _patched_connect
+    sqlite3.connect = _patched_connect
+
+_apply_sqlite3_thread_patch()
 
 
 def get_query_embedding(query: str, config: Dict) -> List[float]:
