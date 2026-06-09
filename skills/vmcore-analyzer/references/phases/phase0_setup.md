@@ -31,10 +31,13 @@ fi
 ## 步骤 0.1：检测 aicrasher MCP 包是否已安装
 
 ```bash
-python3 -c "import aicrasher; print('OK')" 2>/dev/null && echo "INSTALLED" || echo "NOT_INSTALLED"
+python3 -c "import aicrasher; print('OK')" 2>/dev/null && echo "INSTALLED" || \
+"$VENV_PYTHON" -c "import aicrasher; print('OK')" 2>/dev/null && echo "INSTALLED" || echo "NOT_INSTALLED"
 ```
 
 ## 步骤 0.2：如果未安装，自动执行安装
+
+推荐使用项目根目录下的一键安装脚本：
 
 ```bash
 SKILL_DIR="<本 skill 文件所在目录的绝对路径>"
@@ -43,8 +46,18 @@ if [[ -f "$SKILL_DIR/.project_root" ]]; then
 else
     PROJECT_ROOT="$SKILL_DIR"
 fi
-cd "$PROJECT_ROOT" && pip3 install -e ".[cli]"
+bash "$PROJECT_ROOT/scripts/install.sh"
 ```
+
+该脚本会自动创建 venv、安装包并注册 MCP Server。
+
+> 如需手动安装：
+> ```bash
+> python3 -m venv "$PROJECT_ROOT/.venv"
+> source "$PROJECT_ROOT/.venv/bin/activate"
+> pip install -e "$PROJECT_ROOT[cli]"
+> deactivate
+> ```
 
 🔴 安装后必须重新执行步骤 0.1 验证安装成功。
 
@@ -66,27 +79,29 @@ fi
 
 🔴🔴🔴 这一步是强制性的，不是可选的！
 
+> 以下命令假设 `$PROJECT_ROOT` 为项目根目录，`$VENV_PYTHON="$PROJECT_ROOT/.venv/bin/python"`。
+
 ```bash
 if command -v codebuddy >/dev/null 2>&1; then
-    codebuddy mcp add -s user aicrasher -- python3 -m aicrasher.mcp_server
+    codebuddy mcp add -s user aicrasher -- "$VENV_PYTHON" -m aicrasher.mcp_server
 elif command -v claude >/dev/null 2>&1; then
-    claude mcp add -s user aicrasher -- python3 -m aicrasher.mcp_server
+    claude mcp add -s user aicrasher -- "$VENV_PYTHON" -m aicrasher.mcp_server
 elif command -v mcporter >/dev/null 2>&1; then
-    mcporter config add aicrasher --stdio "python3 -m aicrasher.mcp_server" --scope home
+    mcporter config add aicrasher --stdio "$VENV_PYTHON -m aicrasher.mcp_server" --scope home
 fi
 ```
 
 > **各工具注册命令速查：**
-> - **CodeBuddy**: `codebuddy mcp add -s user aicrasher -- python3 -m aicrasher.mcp_server`
-> - **Claude Code**: `claude mcp add -s user aicrasher -- python3 -m aicrasher.mcp_server`
-> - **OpenClaw (mcporter)**: `mcporter config add aicrasher --stdio "python3 -m aicrasher.mcp_server" --scope home`
+> - **CodeBuddy**: `codebuddy mcp add -s user aicrasher -- "$VENV_PYTHON" -m aicrasher.mcp_server`
+> - **Claude Code**: `claude mcp add -s user aicrasher -- "$VENV_PYTHON" -m aicrasher.mcp_server`
+> - **OpenClaw (mcporter)**: `mcporter config add aicrasher --stdio "$VENV_PYTHON -m aicrasher.mcp_server" --scope home`
 
 > **⚠️ OpenClaw 环境关键注意事项：`lifecycle` 必须设为 `keep-alive`**
 >
 > aicrasher 是有状态的 MCP Server——session 需要跨多次 tool call 存活。mcporter 默认 ephemeral 模式会导致 session 丢失。
 > 如 CLI 注册失败，直接编辑 `~/.mcporter/mcporter.json` 添加：
 > ```json
-> { "mcpServers": { "aicrasher": { "command": "python3", "args": ["-m", "aicrasher.mcp_server"], "lifecycle": "keep-alive" } } }
+> { "mcpServers": { "aicrasher": { "command": "<PROJECT_ROOT>/.venv/bin/python", "args": ["-m", "aicrasher.mcp_server"], "lifecycle": "keep-alive" } } }
 > ```
 > 配置修改后执行 `openclaw gateway restart` 使配置生效。
 
@@ -114,7 +129,7 @@ fi
 ## 步骤 0.5：验证安装完成
 
 ```bash
-python3 -c "import aicrasher; print('✅ aicrasher 包: OK')"
+"$VENV_PYTHON" -c "import aicrasher; print('✅ aicrasher 包: OK')"
 
 if command -v codebuddy >/dev/null 2>&1; then
     codebuddy mcp list 2>/dev/null | grep "aicrasher"
@@ -129,7 +144,7 @@ fi
 1. ✅ aicrasher 包导入成功
 2. ✅ MCP server 列表输出中包含 `aicrasher` 且状态正常
 
-> 如果自动安装失败，请手动运行：`bash <skill_dir>/scripts/setup.sh`
+> 如果自动安装失败，请手动运行项目根目录下的安装脚本：`bash "$PROJECT_ROOT/scripts/install.sh"`
 
 ## 步骤 0.6：验证 MCP Server 进程能正常工作
 
@@ -169,7 +184,7 @@ fi
    ```
 2. 尝试手动启动验证是否有错误输出：
    ```bash
-   python3 -m aicrasher.mcp_server 2>&1 &
+   "$VENV_PYTHON" -m aicrasher.mcp_server 2>&1 &
    PID=$!
    sleep 2
    kill $PID 2>/dev/null

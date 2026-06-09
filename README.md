@@ -13,7 +13,7 @@ Claude Code skills for kernel development and debugging.
 | jffs2-analyzer | Static analysis of JFFS2 images | Python |
 | jffs2-mount | Mount JFFS2 in QEMU | QEMU, kernel |
 | jffs2-fault-inject | Inject faults into JFFS2 images | Python |
-| rag-case-retrieval | RAG-based case retrieval | Chroma DB |
+| rag-case-retrieval | RAG-based case retrieval | Chroma DB, openai |
 
 ## Quick Start
 
@@ -28,33 +28,61 @@ ls ~/.claude/skills/  # Should show skill directories
 
 ## Installation
 
-### 1. MCP Server (required for vmcore-analyzer & lock-analyzer)
+### Recommended: One-Click Install
 
 ```bash
-pip install -e .[cli]
-claude mcp add aicrasher -- python3 -m aicrasher.mcp_server
+bash scripts/install.sh
 ```
 
-### 2. Skills
+This script automatically:
+1. Creates a Python virtual environment (`.venv`) and installs the MCP package
+2. Registers the `aicrasher` MCP server (supports both `claude` and `codebuddy` CLI tools)
+3. Installs all 8 skills to the appropriate skills directory
+4. Creates `.env` from `.env.example` if not present
+
+### Manual Installation
+
+**1. MCP Server** (required for vmcore-analyzer & lock-analyzer)
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[cli]"
+# Remove existing registration first if present
+claude mcp remove aicrasher 2>/dev/null || true
+claude mcp add aicrasher -- .venv/bin/python -m aicrasher.mcp_server
+deactivate
+```
+
+**2. Skills**
+
+```bash
+rm -rf ~/.claude/skills/*/ 2>/dev/null || true
 cp -r skills/* ~/.claude/skills/
 ```
 
-### 3. Configuration
+For `codebuddy` CLI, replace `~/.claude/skills/` with `~/.codebuddy/skills/`.
+
+**3. Configuration**
 
 ```bash
 cp .env.example .env
-# Edit .env if needed
+# Edit .env — configure LLM API credentials and crash binary path
 ```
 
 ## MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| analyze_crash | Create session + collect baseline |
-| run_crash_command | Execute crash command |
-| close_crash_session | Close session |
+| analyze_crash | One-shot: create session + collect baseline (sys, bt, log) |
+| create_crash_session | Create a crash debugging session |
+| run_crash_command | Execute a single crash CLI command |
+| run_crash_commands | Execute multiple crash commands sequentially |
+| collect_baseline | Collect baseline diagnostics (sys, bt, log) |
+| close_crash_session | Close and clean up a crash session |
+| export_command_log | Export all recorded commands to JSONL |
+| search_knowledge_base | Search local KB and Red Hat KB for relevant articles |
+| list_sessions | List all active crash sessions |
 
 ## Usage Examples
 
@@ -63,7 +91,7 @@ cp .env.example .env
 /vmcore-analyzer /path/to/vmcore /path/to/vmlinux
 
 # Lock analysis (requires active crash session)
-/lock-analyzer 0xffffffc00012345 --type mutex
+/lock-analyzer --type mutex 0xffffffc00012345
 
 # Kernel build
 /kernel-build JFFS2_FS --arch arm64 --cross
@@ -87,4 +115,4 @@ cp .env.example .env
 - crash utility (for vmcore/lock analysis)
 - GCC toolchain (for kernel-build)
 - QEMU (for qemu-test)
-- Chroma DB (for rag-case-retrieval)
+- Chroma DB + openai (for rag-case-retrieval)

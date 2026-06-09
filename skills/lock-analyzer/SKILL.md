@@ -24,8 +24,7 @@ This skill uses the `aicrasher` MCP Server. Before using this skill, ensure:
 
 If MCP Server is not registered, run:
 ```bash
-pip install -e .[cli]
-claude mcp add aicrasher -- python3 -m aicrasher.mcp_server
+bash scripts/install.sh
 ```
 
 ## Lock Types Supported
