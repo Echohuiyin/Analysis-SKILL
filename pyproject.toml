@@ -35,6 +35,10 @@ dependencies = [
 
 [project.optional-dependencies]
 cli = ["typer[all]", "rich"]
+rag = [
+    "chromadb>=0.4.0",
+    "pysqlite3-binary>=0.5.0; platform_system == 'Linux'",
+]
 
 [project.scripts]
 aicrasher-mcp = "aicrasher.mcp_server:main"

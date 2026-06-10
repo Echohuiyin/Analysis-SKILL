@@ -44,7 +44,7 @@ VENV_DIR="$PROJECT_DIR/.venv"
 
 # Step 1: Create and activate virtual environment
 echo ""
-echo "[1/3] Creating virtual environment and installing MCP Python package..."
+echo "[1/5] Creating virtual environment and installing MCP Python package..."
 
 if [ ! -d "$VENV_DIR" ]; then
     python3 -m venv "$VENV_DIR"
@@ -63,7 +63,7 @@ deactivate
 
 # Step 2: Register MCP Server
 echo ""
-echo "[2/3] Registering MCP Server..."
+echo "[2/5] Registering MCP Server..."
 
 MCP_CMD="$VENV_DIR/bin/python -m aicrasher.mcp_server"
 
@@ -83,7 +83,7 @@ fi
 
 # Step 3: Install Skills
 echo ""
-echo "[3/3] Installing Skills..."
+echo "[3/5] Installing Skills..."
 mkdir -p "$SKILLS_DIR"
 
 SKILLS=("vmcore-analyzer" "lock-analyzer" "kernel-build" "qemu-test"
@@ -102,6 +102,164 @@ done
 if [ ! -f "$PROJECT_DIR/.env" ]; then
     cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
     echo "✓ .env created from .env.example"
+fi
+
+# Step 4: RAG Infrastructure Setup
+echo ""
+echo "[4/5] RAG Infrastructure Setup..."
+
+RAG_SCRIPTS="$PROJECT_DIR/skills/rag-case-retrieval/scripts"
+
+# 4a. sqlite3 version check (Chroma requires >= 3.35.0)
+echo ""
+echo "  [4a] Checking sqlite3 version..."
+SQLITE_VER=$("$VENV_DIR/bin/python" -c "import sqlite3; print(sqlite3.sqlite_version)" 2>/dev/null)
+REQUIRED_SQLITE="3.35.0"
+
+version_ge() {
+    echo "$1" | awk -v req="$2" 'BEGIN {FS="."} {
+        split(req, r, ".");
+        if ($1 > r[1]) exit 0;
+        if ($1 < r[1]) exit 1;
+        if ($2 > r[2]) exit 0;
+        if ($2 < r[2]) exit 1;
+        if ($3 >= r[3]) exit 0;
+        exit 1;
+    }'
+}
+
+if [ -n "$SQLITE_VER" ] && version_ge "$SQLITE_VER" "$REQUIRED_SQLITE"; then
+    echo "  ✓ sqlite3 $SQLITE_VER (meets Chroma >= $REQUIRED_SQLITE requirement)"
+else
+    echo "  ⚠ sqlite3 $SQLITE_VER is below Chroma requirement ($REQUIRED_SQLITE)"
+    echo "  → Installing pysqlite3-binary as replacement..."
+    "$VENV_DIR/bin/pip" install pysqlite3-binary --quiet || echo "  ⚠ pysqlite3-binary install failed"
+fi
+
+# 4b. Install chromadb
+echo ""
+echo "  [4b] Installing chromadb..."
+if "$VENV_DIR/bin/pip" install chromadb --quiet 2>/dev/null; then
+    echo "  ✓ chromadb installed"
+else
+    echo "  ⚠ chromadb installation failed — RAG retrieval will not work"
+    echo "  → Install manually: pip install chromadb"
+fi
+
+# 4c. Docker + Chroma container check
+echo ""
+echo "  [4c] Checking Chroma service..."
+
+CHROMA_CONTAINER="chroma"
+CHROMA_RUNNING=false
+
+if command -v docker &> /dev/null; then
+    if docker ps --filter "name=$CHROMA_CONTAINER" --format '{{.Names}}' 2>/dev/null | grep -q "$CHROMA_CONTAINER"; then
+        echo "  ✓ Chroma container is running (port 8000)"
+        CHROMA_RUNNING=true
+    elif docker ps -a --filter "name=$CHROMA_CONTAINER" --format '{{.Names}}' 2>/dev/null | grep -q "$CHROMA_CONTAINER"; then
+        echo "  → Chroma container exists but stopped, starting..."
+        docker start "$CHROMA_CONTAINER" 2>/dev/null && {
+            echo "  ✓ Chroma container started"
+            CHROMA_RUNNING=true
+        } || echo "  ⚠ Failed to start Chroma container"
+    else
+        echo "  → Pulling and starting Chroma container..."
+        docker run -d -p 8000:8000 --name "$CHROMA_CONTAINER" chromadb/chroma 2>/dev/null && {
+            echo "  ✓ Chroma container started (port 8000)"
+            CHROMA_RUNNING=true
+        } || echo "  ⚠ Failed to start Chroma. Manually: docker run -d -p 8000:8000 --name chroma chromadb/chroma"
+    fi
+else
+    echo "  ⚠ Docker not found. Chroma requires Docker or a standalone Chroma server."
+    echo "  → Install Docker, then: docker run -d -p 8000:8000 --name chroma chromadb/chroma"
+fi
+
+# 4d. Ollama + embedding model check
+echo ""
+echo "  [4d] Checking embedding service..."
+
+OLLAMA_RUNNING=false
+EMBEDDING_READY=false
+
+if command -v ollama &> /dev/null; then
+    # Check if ollama serve is running
+    if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+        echo "  ✓ Ollama is running"
+        OLLAMA_RUNNING=true
+    else
+        echo "  → Starting ollama serve in background..."
+        ollama serve > /dev/null 2>&1 &
+        sleep 2
+        if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+            echo "  ✓ Ollama started"
+            OLLAMA_RUNNING=true
+        else
+            echo "  ⚠ Please start ollama manually: ollama serve"
+        fi
+    fi
+
+    # Check/pull embedding model
+    if [ "$OLLAMA_RUNNING" = true ]; then
+        EMBED_MODEL="${EMBEDDING_MODEL:-bge-large-zh}"
+        if ollama list 2>/dev/null | grep -q "$EMBED_MODEL"; then
+            echo "  ✓ Embedding model '$EMBED_MODEL' already pulled"
+            EMBEDDING_READY=true
+        else
+            echo "  → Pulling embedding model '$EMBED_MODEL' (may take a few minutes)..."
+            ollama pull "$EMBED_MODEL" && {
+                echo "  ✓ Model '$EMBED_MODEL' pulled"
+                EMBEDDING_READY=true
+            } || {
+                echo "  ⚠ Failed to pull '$EMBED_MODEL'. Try: ollama pull $EMBED_MODEL"
+                echo "  → Alternative: set EMBEDDING_BASE_URL + EMBEDDING_API_KEY in .env for cloud API"
+            }
+        fi
+    fi
+else
+    echo "  ⚠ Ollama not installed (recommended for local embedding)"
+    echo "  → Install: curl -fsSL https://ollama.com/install.sh | sh"
+    echo "  → Then: ollama pull bge-large-zh"
+    echo "  → Alternative: set EMBEDDING_BASE_URL + EMBEDDING_API_KEY in .env for cloud API"
+fi
+
+# 4e. Embedding config validation
+echo ""
+echo "  [4e] Validating embedding configuration..."
+
+if [ -f "$PROJECT_DIR/.env" ]; then
+    EMBED_URL=$(grep -E '^EMBEDDING_BASE_URL=' "$PROJECT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+    EMBED_KEY=$(grep -E '^EMBEDDING_API_KEY=' "$PROJECT_DIR/.env" 2>/dev/null | cut -d= -f2-)
+
+    if [ -n "$EMBED_URL" ] && [ "$EMBED_URL" != "http://localhost:11434/v1" ]; then
+        if [ -z "$EMBED_KEY" ] || [ "$EMBED_KEY" = "not-required" ]; then
+            echo "  ⚠ EMBEDDING_BASE_URL set to '$EMBED_URL' but EMBEDDING_API_KEY is not configured"
+            echo "  → Set EMBEDDING_API_KEY in .env for cloud embedding services"
+        else
+            echo "  ✓ Cloud embedding API configured"
+        fi
+    elif [ "$EMBEDDING_READY" = true ]; then
+        echo "  ✓ Using local Ollama embedding ($EMBED_MODEL)"
+    else
+        echo "  ⚠ Using default localhost URL but Ollama is not ready"
+        echo "  → Either install Ollama or configure cloud API in .env"
+    fi
+else
+    echo "  ⚠ .env file not found, skipping embedding config validation"
+fi
+
+# Step 5: Environment Validation
+echo ""
+echo "[5/5] Running RAG environment check..."
+
+if [ -f "$RAG_SCRIPTS/check_environment.py" ]; then
+    "$VENV_DIR/bin/python" "$RAG_SCRIPTS/check_environment.py" 2>&1 || {
+        echo ""
+        echo "  ⚠ RAG environment check found issues (see above)"
+        echo "  → Run manually: python $RAG_SCRIPTS/check_environment.py"
+    }
+else
+    echo "  ⊗ check_environment.py not found at $RAG_SCRIPTS"
 fi
 
 # Summary

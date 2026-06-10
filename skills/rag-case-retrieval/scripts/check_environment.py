@@ -10,6 +10,8 @@ import sqlite3
 from pathlib import Path
 from typing import Dict
 
+from config_loader import get_embedding_config
+
 # ============================================================
 # sqlite3兼容补丁：Chroma要求sqlite3 >= 3.35.0
 # ============================================================
@@ -111,28 +113,24 @@ def check_embedding_service(config: Dict):
     """检查嵌入服务连接"""
     from openai import OpenAI
 
-    embedding_config = config.get("embedding", {})
-    base_url = embedding_config.get("base_url", "http://localhost:11434/v1")
-    model = embedding_config.get("model", "bge-large-zh")
-    api_key = embedding_config.get("api_key", "not-required")
-    timeout = embedding_config.get("timeout", 30)
+    ec = get_embedding_config(config)
 
     # 测试连接通过生成一个测试嵌入
     try:
         client = OpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            timeout=timeout
+            base_url=ec["base_url"],
+            api_key=ec["api_key"],
+            timeout=ec["timeout"]
         )
 
         response = client.embeddings.create(
-            model=model,
+            model=ec["model"],
             input="test"
         )
 
         if response.data and len(response.data) > 0:
             embedding_dim = len(response.data[0].embedding)
-            return True, f"嵌入服务连接正常 (模型: {model}, 维度: {embedding_dim}, 端点: {base_url})"
+            return True, f"嵌入服务连接正常 (模型: {ec['model']}, 维度: {embedding_dim}, 端点: {ec['base_url']})"
         else:
             return False, f"嵌入服务响应异常: 未返回向量数据"
 
@@ -143,18 +141,18 @@ def check_embedding_service(config: Dict):
         if "Connection refused" in error_msg or "connect" in error_msg.lower():
             suggestions = [
                 "请确保嵌入服务正在运行",
-                f"检查 {base_url} 是否可访问",
+                f"检查 {ec['base_url']} 是否可访问",
                 "如果是Ollama: ollama serve",
                 "如果是text-embeddings-inference: 检查Docker容器状态"
             ]
         elif "model" in error_msg.lower() and "not found" in error_msg.lower():
             suggestions = [
-                f"请拉取模型: ollama pull {model}",
-                f"或修改config.json中的embedding.model为可用模型"
+                f"请拉取模型: ollama pull {ec['model']}",
+                f"或设置EMBEDDING_MODEL环境变量为可用模型"
             ]
         else:
             suggestions = [
-                f"检查服务配置: {base_url}",
+                f"检查服务配置: {ec['base_url']}",
                 "验证模型名称是否正确",
                 "检查服务日志"
             ]
@@ -203,13 +201,6 @@ def main():
         print(f"配置文件: {config_path}")
     else:
         config = {
-            "embedding": {
-                "base_url": "http://localhost:11434/v1",
-                "model": "bge-large-zh",
-                "api_key": "not-required",
-                "timeout": 30,
-                "dimension": 1024
-            },
             "vectorization": {
                 "head_chars": 400,
                 "title_injection": True
@@ -218,11 +209,12 @@ def main():
         print("配置文件: 未找到，使用默认配置")
 
     # 显示配置信息
-    embedding_config = config.get("embedding", {})
+    ec = get_embedding_config(config)
     vec_config = config.get("vectorization", {})
     print(f"\n当前配置:")
-    print(f"  嵌入模型: {embedding_config.get('model', 'bge-large-zh')}")
-    print(f"  向量维度: {embedding_config.get('dimension', 1024)}")
+    print(f"  嵌入服务: {ec['base_url']}")
+    print(f"  嵌入模型: {ec['model']}")
+    print(f"  向量维度: {ec['dimension']}")
     print(f"  向量化策略: 定长 (头{vec_config.get('head_chars', 400)}字符 + 标题注入)")
 
     # 1. 检查依赖

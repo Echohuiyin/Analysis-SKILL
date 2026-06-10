@@ -21,6 +21,8 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
+from config_loader import get_embedding_config
+
 # ============================================================
 # sqlite3兼容补丁：Chroma要求sqlite3 >= 3.35.0
 # ============================================================
@@ -300,18 +302,18 @@ class EmbeddingBatchProcessor:
         """懒加载OpenAI客户端"""
         if self._client is None:
             from openai import OpenAI
-            embedding_config = self.config.get("embedding", {})
+            ec = get_embedding_config(self.config)
             self._client = OpenAI(
-                base_url=embedding_config.get("base_url", "http://localhost:11434/v1"),
-                api_key=embedding_config.get("api_key", "not-required"),
-                timeout=embedding_config.get("timeout", 60)
+                base_url=ec["base_url"],
+                api_key=ec["api_key"],
+                timeout=ec["timeout"]
             )
         return self._client
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """生成一批向量"""
         client = self._get_client()
-        model = self.config.get("embedding", {}).get("model", "bge-large-zh")
+        model = get_embedding_config(self.config)["model"]
 
         response = client.embeddings.create(model=model, input=texts)
         return [item.embedding for item in response.data]
@@ -416,8 +418,8 @@ def store_to_chroma_stream(cases: Iterator[Dict[str, Any]], config: Dict,
         port=int(host.split(":")[-1])
     )
 
-    embedding_model = config.get("embedding", {}).get("model", "bge-large-zh")
-    embedding_dimension = config.get("embedding", {}).get("dimension", 1024)
+    embedding_model = get_embedding_config(config)["model"]
+    embedding_dimension = get_embedding_config(config)["dimension"]
 
     # 创建或获取collection
     try:
@@ -544,11 +546,6 @@ def main():
                 config = json.load(f)
         else:
             config = {
-                "embedding": {
-                    "base_url": "http://localhost:11434/v1",
-                    "model": "bge-large-zh",
-                    "dimension": 1024
-                },
                 "vectorization": {
                     "head_chars": 400,
                     "title_injection": True
@@ -559,7 +556,7 @@ def main():
     print("高性能ZIP包导入")
     print("=" * 60)
     print(f"批量大小: {args.batch_size}")
-    print(f"模型: {config.get('embedding', {}).get('model', 'bge-large-zh')}")
+    print(f"模型: {get_embedding_config(config)['model']}")
     print("=" * 60)
 
     # 统计ZIP文件

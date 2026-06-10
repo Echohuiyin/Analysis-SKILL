@@ -12,36 +12,33 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
+from config_loader import get_embedding_config
+
 def get_embeddings(texts: List[str], config: Dict) -> List[List[float]]:
     """生成文本向量 (使用本地OpenAI兼容服务)"""
     from openai import OpenAI
 
-    embedding_config = config.get("embedding", {})
-    base_url = embedding_config.get("base_url", "http://localhost:11434/v1")
-    model = embedding_config.get("model", "bge-large-zh")
-    api_key = embedding_config.get("api_key", "not-required")
-    timeout = embedding_config.get("timeout", 30)
-    batch_size = embedding_config.get("batch_size", 100)
+    ec = get_embedding_config(config)
 
     client = OpenAI(
-        base_url=base_url,
-        api_key=api_key,
-        timeout=timeout
+        base_url=ec["base_url"],
+        api_key=ec["api_key"],
+        timeout=ec["timeout"]
     )
 
     all_embeddings = []
 
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
+    for i in range(0, len(texts), ec["batch_size"]):
+        batch = texts[i:i + ec["batch_size"]]
         try:
             response = client.embeddings.create(
-                model=model,
+                model=ec["model"],
                 input=batch
             )
             batch_embeddings = [item.embedding for item in response.data]
             all_embeddings.extend(batch_embeddings)
         except Exception as e:
-            raise Exception(f"Failed to generate embeddings from {base_url}: {str(e)}")
+            raise Exception(f"Failed to generate embeddings from {ec['base_url']}: {str(e)}")
 
     return all_embeddings
 
@@ -168,8 +165,8 @@ def store_to_chroma(cases: List[Dict], config: Dict,
     client = chromadb.HttpClient(host=host.split("://")[1].split(":")[0],
                                   port=int(host.split(":")[-1]))
 
-    embedding_model = config.get("embedding", {}).get("model", "bge-large-zh")
-    embedding_dimension = config.get("embedding", {}).get("dimension", 1024)
+    embedding_model = get_embedding_config(config)["model"]
+    embedding_dimension = get_embedding_config(config)["dimension"]
 
     # 创建或获取collection（使用cosine距离）
     try:
@@ -315,10 +312,10 @@ def main():
     print("=" * 60)
     print("案例导入 - 定长向量化策略")
     print("=" * 60)
-    embedding_config = config.get("embedding", {})
+    ec = get_embedding_config(config)
     vec_config = config.get("vectorization", {})
-    print(f"嵌入模型: {embedding_config.get('model', 'bge-large-zh')}")
-    print(f"向量维度: {embedding_config.get('dimension', 1024)}")
+    print(f"嵌入模型: {ec['model']}")
+    print(f"向量维度: {ec['dimension']}")
     print(f"距离度量: cosine")
     print(f"向量化策略: 定长 (头{vec_config.get('head_chars', 400)}字符 + 标题注入)")
     print("=" * 60)

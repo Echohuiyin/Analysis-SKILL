@@ -14,6 +14,8 @@ import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+from config_loader import get_embedding_config
+
 # ============================================================
 # sqlite3兼容补丁：Chroma要求sqlite3 >= 3.35.0
 # ============================================================
@@ -89,26 +91,22 @@ def get_query_embedding(query: str, config: Dict) -> List[float]:
     """将查询文本转为向量 (使用本地OpenAI兼容服务)"""
     from openai import OpenAI
 
-    embedding_config = config.get("embedding", {})
-    base_url = embedding_config.get("base_url", "http://localhost:11434/v1")
-    model = embedding_config.get("model", "bge-large-zh")
-    api_key = embedding_config.get("api_key", "not-required")
-    timeout = embedding_config.get("timeout", 30)
+    ec = get_embedding_config(config)
 
     client = OpenAI(
-        base_url=base_url,
-        api_key=api_key,
-        timeout=timeout
+        base_url=ec["base_url"],
+        api_key=ec["api_key"],
+        timeout=ec["timeout"]
     )
 
     try:
         response = client.embeddings.create(
-            model=model,
+            model=ec["model"],
             input=query
         )
         return response.data[0].embedding
     except Exception as e:
-        raise Exception(f"Failed to generate embedding from {base_url}: {str(e)}")
+        raise Exception(f"Failed to generate embedding from {ec['base_url']}: {str(e)}")
 
 def retrieve_cases(query_embedding: List[float],
                   collection_name: str = "cases",
@@ -200,7 +198,7 @@ def format_output(query: str, cases: List[Dict], config: Dict,
             "top_k": top_k,
             "min_similarity": min_similarity,
             "filters": config.get("filters", {}),
-            "embedding_model": config.get("embedding", {}).get("model", "bge-large-zh"),
+            "embedding_model": get_embedding_config(config)["model"],
             "distance_metric": "cosine"
         },
         "results": cases,
@@ -261,13 +259,6 @@ def main():
     else:
         config = {
             "chroma": {"host": "http://localhost:8000"},
-            "embedding": {
-                "base_url": "http://localhost:11434/v1",
-                "model": "bge-large-zh",
-                "api_key": "not-required",
-                "timeout": 30,
-                "dimension": 1024
-            },
             "retrieval": {
                 "default_top_k": 3,
                 "min_similarity": 0.7,
@@ -286,7 +277,7 @@ def main():
 
     chroma_host = config.get("chroma", {}).get("host", "http://localhost:8000")
     collection_name = args.collection
-    embedding_model = config.get("embedding", {}).get("model", "bge-large-zh")
+    ec = get_embedding_config(config)
 
     # 打印检索信息
     print("=" * 60)
@@ -294,7 +285,7 @@ def main():
     print("=" * 60)
     print(f"查询: {args.query}")
     print(f"参数: top_k={top_k}, min_similarity={min_similarity}")
-    print(f"模型: {embedding_model} ({config.get('embedding', {}).get('dimension', 1024)}维)")
+    print(f"模型: {ec['model']} ({ec['dimension']}维)")
     print(f"距离: cosine")
     print("=" * 60)
 
