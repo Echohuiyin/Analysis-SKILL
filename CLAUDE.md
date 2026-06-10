@@ -21,6 +21,7 @@ Analysis-SKILL/
 | lock-analyzer | Yes | Lock debugging |
 | kernel-build | No | Kernel compilation |
 | qemu-test | No | QEMU testing |
+| kernel-test-validator | No | Kernel reproduction validation |
 | jffs2-* | No | JFFS2 analysis |
 | rag-case-retrieval | No | Case retrieval |
 
