@@ -270,5 +270,13 @@ echo ""
 # Verify MCP
 if [ "$CLI" = "claude" ]; then
     echo "Verify MCP:"
-    claude mcp list | grep aicrasher && echo "✓ MCP registered" || echo "⊗ Check MCP registration"
+    if claude mcp list | grep -q aicrasher; then
+        echo "✓ MCP registered"
+    else
+        echo "⊗ MCP registration check failed"
+        echo ""
+        echo "Troubleshooting: If MCP fails to connect, try:"
+        echo "  claude mcp remove aicrasher"
+        echo "  claude mcp add aicrasher -- $MCP_CMD"
+    fi
 fi
