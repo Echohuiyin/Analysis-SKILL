@@ -98,16 +98,21 @@ def check_dependencies():
 
     return missing
 
-def check_chroma_connection(host="http://localhost:8000", timeout=5):
-    """检查Chroma服务连接"""
+def check_chroma_local(chroma_path=None):
+    """检查Chroma本地持久化存储"""
     try:
         import chromadb
-        client = chromadb.HttpClient(host=host.split("://")[1].split(":")[0],
-                                     port=int(host.split(":")[-1]))
-        client.heartbeat()
-        return True, "Chroma服务连接正常"
+        from pathlib import Path
+
+        if chroma_path is None:
+            chroma_path = str(Path.home() / ".local" / "share" / "chroma_rag")
+
+        client = chromadb.PersistentClient(path=chroma_path)
+        # 测试连接（尝试获取collections列表）
+        collections = client.list_collections()
+        return True, f"Chroma本地存储正常 (路径: {chroma_path}, collections: {len(collections)})"
     except Exception as e:
-        return False, f"无法连接Chroma: {str(e)}"
+        return False, f"无法访问Chroma本地存储: {str(e)}"
 
 def check_embedding_service(config: Dict):
     """检查嵌入服务连接"""
@@ -159,12 +164,16 @@ def check_embedding_service(config: Dict):
 
         return False, f"无法连接嵌入服务: {error_msg}\n建议:\n" + "\n".join(f"  - {s}" for s in suggestions)
 
-def check_collection(collection_name="cases", host="http://localhost:8000"):
-    """检查Collection状态"""
+def check_collection(collection_name="cases", chroma_path=None):
+    """检查Collection状态（本地持久化模式）"""
     try:
         import chromadb
-        client = chromadb.HttpClient(host=host.split("://")[1].split(":")[0],
-                                     port=int(host.split(":")[-1]))
+        from pathlib import Path
+
+        if chroma_path is None:
+            chroma_path = str(Path.home() / ".local" / "share" / "chroma_rag")
+
+        client = chromadb.PersistentClient(path=chroma_path)
         collection = client.get_collection(name=collection_name)
         count = collection.count()
         metadata = collection.metadata or {}
@@ -172,6 +181,7 @@ def check_collection(collection_name="cases", host="http://localhost:8000"):
             "name": collection_name,
             "count": count,
             "metadata": metadata,
+            "path": chroma_path,
             "distance_metric": metadata.get("hnsw:space", "unknown"),
             "embedding_model": metadata.get("embedding_model", "unknown"),
             "embedding_dimension": metadata.get("embedding_dimension", "unknown"),
@@ -211,11 +221,15 @@ def main():
     # 显示配置信息
     ec = get_embedding_config(config)
     vec_config = config.get("vectorization", {})
+    chroma_config = config.get("chroma", {})
     print(f"\n当前配置:")
-    print(f"  嵌入服务: {ec['base_url']}")
     print(f"  嵌入模型: {ec['model']}")
     print(f"  向量维度: {ec['dimension']}")
     print(f"  向量化策略: 定长 (头{vec_config.get('head_chars', 400)}字符 + 标题注入)")
+    if chroma_config.get("path"):
+        print(f"  Chroma路径: {chroma_config['path']}")
+    else:
+        print(f"  Chroma路径: ~/.local/share/chroma_rag (默认)")
 
     # 1. 检查依赖
     print("\n[1/4] 检查Python依赖...")
@@ -235,23 +249,26 @@ def main():
         print(f"  ❌ {msg}")
         return 1
 
-    # 3. 检查Chroma连接
-    print("\n[3/4] 检查Chroma服务...")
-    host = config.get("chroma", {}).get("host", "http://localhost:8000")
+    # 3. 检查Chroma本地存储
+    print("\n[3/4] 检查Chroma本地存储...")
+    chroma_path = config.get("chroma", {}).get("path", None)
+    if chroma_path:
+        print(f"  配置路径: {chroma_path}")
+    else:
+        print(f"  默认路径: ~/.local/share/chroma_rag")
 
-    success, msg = check_chroma_connection(host)
+    success, msg = check_chroma_local(chroma_path)
     if success:
         print(f"  ✅ {msg}")
     else:
         print(f"  ❌ {msg}")
-        print("  启动命令: docker run -d -p 8000:8000 chromadb/chroma")
         return 1
 
     # 4. 检查Collection
     print("\n[4/4] 检查Collection状态...")
     collection_name = config.get("chroma", {}).get("collection_name", "cases")
 
-    success, result = check_collection(collection_name, host)
+    success, result = check_collection(collection_name, chroma_path)
     if success:
         print(f"  ✅ Collection '{result['name']}' 存在")
         print(f"     - 文档数量: {result['count']}")

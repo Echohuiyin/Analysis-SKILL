@@ -54,8 +54,8 @@ fi
 # Activate venv
 source "$VENV_DIR/bin/activate"
 
-# Install package
-pip install -e "$PROJECT_DIR[cli]" --quiet
+# Install package (use python -m pip to avoid shebang path issues)
+"$VENV_DIR/bin/python" -m pip install -e "$PROJECT_DIR[cli]" --quiet
 echo "✓ MCP package installed in virtual environment"
 
 # Deactivate venv
@@ -133,47 +133,25 @@ if [ -n "$SQLITE_VER" ] && version_ge "$SQLITE_VER" "$REQUIRED_SQLITE"; then
 else
     echo "  ⚠ sqlite3 $SQLITE_VER is below Chroma requirement ($REQUIRED_SQLITE)"
     echo "  → Installing pysqlite3-binary as replacement..."
-    "$VENV_DIR/bin/pip" install pysqlite3-binary --quiet || echo "  ⚠ pysqlite3-binary install failed"
+    "$VENV_DIR/bin/python" -m pip install pysqlite3-binary --quiet || echo "  ⚠ pysqlite3-binary install failed"
 fi
 
 # 4b. Install chromadb
 echo ""
 echo "  [4b] Installing chromadb..."
-if "$VENV_DIR/bin/pip" install chromadb --quiet 2>/dev/null; then
+if "$VENV_DIR/bin/python" -m pip install chromadb --quiet 2>/dev/null; then
     echo "  ✓ chromadb installed"
 else
     echo "  ⚠ chromadb installation failed — RAG retrieval will not work"
-    echo "  → Install manually: pip install chromadb"
+    echo "  → Install manually: $VENV_DIR/bin/python -m pip install chromadb"
 fi
 
-# 4c. Docker + Chroma container check
+# 4c. Chroma local storage (PersistentClient mode, no Docker required)
 echo ""
-echo "  [4c] Checking Chroma service..."
-
-CHROMA_CONTAINER="chroma"
-CHROMA_RUNNING=false
-
-if command -v docker &> /dev/null; then
-    if docker ps --filter "name=$CHROMA_CONTAINER" --format '{{.Names}}' 2>/dev/null | grep -q "$CHROMA_CONTAINER"; then
-        echo "  ✓ Chroma container is running (port 8000)"
-        CHROMA_RUNNING=true
-    elif docker ps -a --filter "name=$CHROMA_CONTAINER" --format '{{.Names}}' 2>/dev/null | grep -q "$CHROMA_CONTAINER"; then
-        echo "  → Chroma container exists but stopped, starting..."
-        docker start "$CHROMA_CONTAINER" 2>/dev/null && {
-            echo "  ✓ Chroma container started"
-            CHROMA_RUNNING=true
-        } || echo "  ⚠ Failed to start Chroma container"
-    else
-        echo "  → Pulling and starting Chroma container..."
-        docker run -d -p 8000:8000 --name "$CHROMA_CONTAINER" chromadb/chroma 2>/dev/null && {
-            echo "  ✓ Chroma container started (port 8000)"
-            CHROMA_RUNNING=true
-        } || echo "  ⚠ Failed to start Chroma. Manually: docker run -d -p 8000:8000 --name chroma chromadb/chroma"
-    fi
-else
-    echo "  ⚠ Docker not found. Chroma requires Docker or a standalone Chroma server."
-    echo "  → Install Docker, then: docker run -d -p 8000:8000 --name chroma chromadb/chroma"
-fi
+echo "  [4c] Chroma local storage setup..."
+echo "  ℹ️  Using PersistentClient mode (local storage, no Docker required)"
+echo "  → Default path: ~/.local/share/chroma_rag"
+echo "  ✓ Chroma will use local persistent storage"
 
 # 4d. Ollama + embedding model check
 echo ""
@@ -201,7 +179,7 @@ if command -v ollama &> /dev/null; then
 
     # Check/pull embedding model
     if [ "$OLLAMA_RUNNING" = true ]; then
-        EMBED_MODEL="${EMBEDDING_MODEL:-bge-large-zh}"
+        EMBED_MODEL="${EMBEDDING_MODEL:-nomic-embed-text}"
         if ollama list 2>/dev/null | grep -q "$EMBED_MODEL"; then
             echo "  ✓ Embedding model '$EMBED_MODEL' already pulled"
             EMBEDDING_READY=true
@@ -219,7 +197,7 @@ if command -v ollama &> /dev/null; then
 else
     echo "  ⚠ Ollama not installed (recommended for local embedding)"
     echo "  → Install: curl -fsSL https://ollama.com/install.sh | sh"
-    echo "  → Then: ollama pull bge-large-zh"
+    echo "  → Then: ollama pull nomic-embed-text"
     echo "  → Alternative: set EMBEDDING_BASE_URL + EMBEDDING_API_KEY in .env for cloud API"
 fi
 
@@ -250,16 +228,27 @@ fi
 
 # Step 5: Environment Validation
 echo ""
-echo "[5/5] Running RAG environment check..."
+echo "[5/5] Running environment check..."
 
-if [ -f "$RAG_SCRIPTS/check_environment.py" ]; then
-    "$VENV_DIR/bin/python" "$RAG_SCRIPTS/check_environment.py" 2>&1 || {
+if [ -f "$PROJECT_DIR/scripts/check_core.py" ]; then
+    "$VENV_DIR/bin/python" "$PROJECT_DIR/scripts/check_core.py" 2>&1 || {
         echo ""
-        echo "  ⚠ RAG environment check found issues (see above)"
-        echo "  → Run manually: python $RAG_SCRIPTS/check_environment.py"
+        echo "  ⚠ Core environment check found issues (see above)"
+        echo "  → Run manually: $VENV_DIR/bin/python $PROJECT_DIR/scripts/check_core.py"
     }
+
+    # Optional: RAG-specific check
+    if [ -f "$RAG_SCRIPTS/check_environment.py" ]; then
+        echo ""
+        echo "Optional: Check RAG environment..."
+        "$VENV_DIR/bin/python" "$RAG_SCRIPTS/check_environment.py" 2>&1 || {
+            echo ""
+            echo "  ⚠ RAG environment check found issues (see above)"
+            echo "  → Run manually: $VENV_DIR/bin/python $RAG_SCRIPTS/check_environment.py"
+        }
+    fi
 else
-    echo "  ⊗ check_environment.py not found at $RAG_SCRIPTS"
+    echo "  ⊗ check_core.py not found at $PROJECT_DIR/scripts"
 fi
 
 # Summary

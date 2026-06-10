@@ -1,18 +1,16 @@
 {
   "chroma": {
-    "host": "http://localhost:8000",
-    "collection_name": "cases",
-    "timeout": 30,
-    "retry_attempts": 3
+    "path": null,
+    "collection_name": "cases"
   },
   "embedding": {
     "base_url": "http://localhost:11434/v1",
-    "model": "bge-large-zh",
+    "model": "nomic-embed-text",
     "api_key": "not-required",
     "timeout": 30,
     "batch_size": 100,
     "max_retries": 3,
-    "dimension": 1024,
+    "dimension": 768,
     "max_tokens": 512
   },
   "retrieval": {

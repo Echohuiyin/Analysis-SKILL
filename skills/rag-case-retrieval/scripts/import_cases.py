@@ -147,23 +147,28 @@ def import_from_csv(file_path: str, mapping: Dict) -> List[Dict]:
 
 def store_to_chroma(cases: List[Dict], config: Dict,
                    collection_name: str = "cases",
-                   host: str = "http://localhost:8000") -> Dict:
+                   chroma_path: str = None) -> Dict:
     """
     将案例存储到Chroma（定长向量化，每篇案例1个向量）
+    使用PersistentClient本地持久化模式（无需Docker）
 
     Args:
         cases: 案例列表
         config: 配置字典
         collection_name: Collection名称
-        host: Chroma服务地址
+        chroma_path: Chroma本地存储路径（默认: ~/.local/share/chroma_rag）
 
     Returns:
         统计信息
     """
     import chromadb
+    from pathlib import Path
 
-    client = chromadb.HttpClient(host=host.split("://")[1].split(":")[0],
-                                  port=int(host.split(":")[-1]))
+    # 设置默认存储路径
+    if chroma_path is None:
+        chroma_path = str(Path.home() / ".local" / "share" / "chroma_rag")
+
+    client = chromadb.PersistentClient(path=chroma_path)
 
     embedding_model = get_embedding_config(config)["model"]
     embedding_dimension = get_embedding_config(config)["dimension"]
@@ -347,16 +352,20 @@ def main():
         print("❌ 没有读取到任何案例")
         return 1
 
-    # 存储到Chroma
-    chroma_host = config.get("chroma", {}).get("host", "http://localhost:8000")
+    # 存储到Chroma（本地持久化模式）
+    chroma_path = config.get("chroma", {}).get("path", None)
 
-    print(f"\n导入到Chroma ({chroma_host})...")
+    print(f"\n导入到Chroma...")
+    if chroma_path:
+        print(f"  存储路径: {chroma_path}")
+    else:
+        print(f"  存储路径: ~/.local/share/chroma_rag (默认)")
     start_time = time.time()
     stats = store_to_chroma(
         cases,
         config=config,
         collection_name=args.collection,
-        host=chroma_host
+        chroma_path=chroma_path
     )
     elapsed = time.time() - start_time
 

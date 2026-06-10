@@ -13,7 +13,7 @@ Claude Code skills for kernel development and debugging.
 | jffs2-analyzer | Static analysis of JFFS2 images | Python |
 | jffs2-mount | Mount JFFS2 in QEMU | QEMU, kernel |
 | jffs2-fault-inject | Inject faults into JFFS2 images | Python |
-| rag-case-retrieval | RAG-based case retrieval | Chroma DB, openai |
+| rag-case-retrieval | RAG-based case retrieval | chromadb, openai (Ollama optional) |
 
 ## Quick Start
 
@@ -25,6 +25,23 @@ bash scripts/install.sh
 claude mcp list  # Should show 'aicrasher'
 ls ~/.claude/skills/  # Should show skill directories
 ```
+
+## Prerequisites
+
+Before running install.sh, ensure:
+
+| Requirement | Check Command | Notes |
+|-------------|---------------|-------|
+| Python 3.10+ | `python3 --version` | Required for all skills |
+| Claude CLI | `which claude` | Install from [claude.ai/code](https://claude.ai/code) |
+| crash utility | `which crash` | Required for vmcore/lock analysis |
+| GCC toolchain | `which gcc` | Required for kernel-build |
+| QEMU | `which qemu-system-*` | Required for qemu-test |
+| (Optional) Ollama | `which ollama` | For local embedding (RAG) |
+
+**RAG Skill Specific**:
+- Local embedding: Install [Ollama](https://ollama.com) and pull model: `ollama pull nomic-embed-text`
+- Cloud embedding: Set `EMBEDDING_BASE_URL` and `EMBEDDING_API_KEY` in `.env`
 
 ## Installation
 
@@ -39,6 +56,24 @@ This script automatically:
 2. Registers the `aicrasher` MCP server (supports both `claude` and `codebuddy` CLI tools)
 3. Installs all 8 skills to the appropriate skills directory
 4. Creates `.env` from `.env.example` if not present
+5. Installs chromadb for RAG (uses local PersistentClient mode, no Docker required)
+6. (Optional) Checks Ollama for local embedding
+
+### Verify Installation
+
+```bash
+# Core environment check
+python scripts/check_core.py
+
+# RAG-specific check (optional)
+python skills/rag-case-retrieval/scripts/check_environment.py
+
+# Verify MCP
+claude mcp list  # Should show 'aicrasher'
+
+# Verify skills
+ls ~/.claude/skills/  # Should show skill directories
+```
 
 ### Manual Installation
 
@@ -98,6 +133,13 @@ cp .env.example .env
 
 # QEMU test
 /qemu-test --arch arm64 --kernel arch/arm64/boot/Image
+
+# RAG case retrieval (example)
+# Import cases from ZIP
+python ~/.claude/skills/rag-case-retrieval/scripts/import_from_zip.py --zip cases.zip
+
+# Retrieve similar cases
+python ~/.claude/skills/rag-case-retrieval/scripts/retrieve_cases.py "kernel panic"
 ```
 
 ## Documentation
@@ -115,4 +157,54 @@ cp .env.example .env
 - crash utility (for vmcore/lock analysis)
 - GCC toolchain (for kernel-build)
 - QEMU (for qemu-test)
-- Chroma DB + openai (for rag-case-retrieval)
+- chromadb package (for rag-case-retrieval, uses local storage)
+- (Optional) Ollama for local embedding (recommended, no data leakage)
+
+## Troubleshooting
+
+### MCP Server Connection Failed
+
+If `claude mcp list` shows "Failed to connect":
+```bash
+# Check MCP Server status
+claude mcp list
+
+# Re-register MCP Server
+claude mcp remove aicrasher
+claude mcp add aicrasher -- .venv/bin/python -m aicrasher.mcp_server
+```
+
+### RAG Embedding Service
+
+**Local Ollama (recommended)**:
+```bash
+# Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Start service
+ollama serve
+
+# Pull embedding model
+ollama pull nomic-embed-text
+
+# Verify
+curl http://localhost:11434/api/tags
+```
+
+**Cloud API**:
+```bash
+# Edit .env file
+EMBEDDING_BASE_URL=https://api.openai.com/v1
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_API_KEY=sk-your-key-here
+```
+
+### pip Install Issues
+
+If pip install fails or installs to wrong location:
+```bash
+# Use python -m pip (recommended)
+.venv/bin/python -m pip install chromadb
+
+# Avoid using .venv/bin/pip directly (shebang issues)
+```

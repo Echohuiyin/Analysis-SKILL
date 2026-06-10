@@ -394,16 +394,17 @@ def prepare_fixed_length_text(title: str, content: str, config: Dict) -> str:
 
 def store_to_chroma_stream(cases: Iterator[Dict[str, Any]], config: Dict,
                            collection_name: str = "cases",
-                           host: str = "http://localhost:8000",
+                           chroma_path: str = None,
                            batch_size: int = 200) -> Dict:
     """
     流式存储案例到Chroma（批量写入优化）
+    使用PersistentClient本地持久化模式（无需Docker）
 
     Args:
         cases: 案例迭代器
         config: 配置
         collection_name: Collection名称
-        host: Chroma地址
+        chroma_path: Chroma本地存储路径（默认: ~/.local/share/chroma_rag）
         batch_size: 批量写入大小
 
     Returns:
@@ -412,11 +413,13 @@ def store_to_chroma_stream(cases: Iterator[Dict[str, Any]], config: Dict,
     apply_sqlite3_monkey_patch()
 
     import chromadb
+    from pathlib import Path
 
-    client = chromadb.HttpClient(
-        host=host.split("://")[1].split(":")[0],
-        port=int(host.split(":")[-1])
-    )
+    # 设置默认存储路径
+    if chroma_path is None:
+        chroma_path = str(Path.home() / ".local" / "share" / "chroma_rag")
+
+    client = chromadb.PersistentClient(path=chroma_path)
 
     embedding_model = get_embedding_config(config)["model"]
     embedding_dimension = get_embedding_config(config)["dimension"]
@@ -580,16 +583,21 @@ def main():
             for case in iterate_zip_markdown(zip_path, args.max_depth):
                 yield case
 
-    # 流式存储到Chroma
-    chroma_host = config.get("chroma", {}).get("host", "http://localhost:8000")
-    print(f"\n导入到Chroma ({chroma_host})...")
+    # 流式存储到Chroma（本地持久化模式）
+    chroma_path = config.get("chroma", {}).get("path", None)
+
+    print(f"\n导入到Chroma...")
+    if chroma_path:
+        print(f"  存储路径: {chroma_path}")
+    else:
+        print(f"  存储路径: ~/.local/share/chroma_rag (默认)")
 
     start_time = time.time()
     stats = store_to_chroma_stream(
         case_iterator(),
         config=config,
         collection_name=args.collection,
-        host=chroma_host,
+        chroma_path=chroma_path,
         batch_size=args.batch_size
     )
     elapsed = time.time() - start_time

@@ -110,17 +110,18 @@ def get_query_embedding(query: str, config: Dict) -> List[float]:
 
 def retrieve_cases(query_embedding: List[float],
                   collection_name: str = "cases",
-                  host: str = "http://localhost:8000",
+                  chroma_path: str = None,
                   top_k: int = 3,
                   min_similarity: float = 0.7,
                   filters: Optional[Dict] = None) -> List[Dict]:
     """
     从Chroma检索最相关的案例（cosine距离）
+    使用PersistentClient本地持久化模式（无需Docker）
 
     Args:
         query_embedding: 查询向量
         collection_name: Collection名称
-        host: Chroma服务地址
+        chroma_path: Chroma本地存储路径（默认: ~/.local/share/chroma_rag）
         top_k: 返回数量
         min_similarity: 最小相似度阈值
         filters: 元数据过滤条件
@@ -129,9 +130,13 @@ def retrieve_cases(query_embedding: List[float],
         案例列表
     """
     import chromadb
+    from pathlib import Path
 
-    client = chromadb.HttpClient(host=host.split("://")[1].split(":")[0],
-                                  port=int(host.split(":")[-1]))
+    # 设置默认存储路径
+    if chroma_path is None:
+        chroma_path = str(Path.home() / ".local" / "share" / "chroma_rag")
+
+    client = chromadb.PersistentClient(path=chroma_path)
 
     try:
         collection = client.get_collection(name=collection_name)
@@ -275,7 +280,7 @@ def main():
     top_k = args.top_k if args.top_k else config.get("retrieval", {}).get("default_top_k", 3)
     min_similarity = args.min_similarity if args.min_similarity else config.get("retrieval", {}).get("min_similarity", 0.7)
 
-    chroma_host = config.get("chroma", {}).get("host", "http://localhost:8000")
+    chroma_path = config.get("chroma", {}).get("path", None)
     collection_name = args.collection
     ec = get_embedding_config(config)
 
@@ -287,6 +292,10 @@ def main():
     print(f"参数: top_k={top_k}, min_similarity={min_similarity}")
     print(f"模型: {ec['model']} ({ec['dimension']}维)")
     print(f"距离: cosine")
+    if chroma_path:
+        print(f"存储: {chroma_path}")
+    else:
+        print(f"存储: ~/.local/share/chroma_rag (默认)")
     print("=" * 60)
 
     # 生成查询向量
@@ -315,7 +324,7 @@ def main():
         cases = retrieve_cases(
             query_embedding,
             collection_name=collection_name,
-            host=chroma_host,
+            chroma_path=chroma_path,
             top_k=top_k,
             min_similarity=min_similarity,
             filters=filters
