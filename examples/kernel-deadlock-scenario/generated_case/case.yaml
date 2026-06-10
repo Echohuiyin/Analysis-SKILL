@@ -1,0 +1,49 @@
+case_id: "CACHE-DEADLOCK-001"
+description: "Cache subsystem mutex ABBA deadlock reproduction"
+source: "vmcore-analysis-2026-06-10"
+kernel_version: "6.6.0"
+architecture: arm64
+
+# Reproducer type
+test_case_type: kernel_module
+
+# Patches (the reproducer module itself)
+patches:
+  - reproducer.patch
+  description: "Kernel module creating ABBA mutex deadlock"
+
+# Kernel configs needed
+configs:
+  - CONFIG_LOCKDEP=y
+  - CONFIG_DEBUG_MUTEXES=y
+  - CONFIG_DEBUG_LOCK_ALLOC=y
+  - CONFIG_MUTEX_SPIN_ON_OWNER=y
+
+# Test verification
+test_method: script
+test_script: tests/run_deadlock_test.sh
+test_command: "dmesg | grep -i 'hung task'"
+expected_result: "hung task blocked for >120s"
+timeout: 150
+
+# Generator metadata
+generator_verification: passed
+generator_notes: |
+  Self-verification completed:
+  - Module compiles successfully
+  - Module loads/unloads cleanly (basic check)
+  - No immediate crash on load
+  - Threads start successfully
+  
+  Design rationale:
+  - Kernel module chosen for precise timing control
+  - Lockdep enabled for validation
+  - Timeout 150s (kernel hung_task_timeout is 120s)
+  - Two threads with opposite lock order create deadlock
+
+# Expected kernel messages
+expected_messages:
+  - "cache_flush_thread: acquired mutex_cache_read"
+  - "cache_read_thread: acquired mutex_cache_write"
+  - "hung task blocked"
+  - "lockdep: circular locking dependency detected"
