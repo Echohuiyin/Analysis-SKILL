@@ -86,7 +86,7 @@ echo ""
 echo "[3/5] Installing Skills..."
 mkdir -p "$SKILLS_DIR"
 
-SKILLS=("vmcore-analyzer" "lock-analyzer" "kernel-build" "qemu-test"
+SKILLS=("vmcore-analyzer" "lock-analyzer" "kernel-build" "kernel-fault-injection" "qemu-test"
         "jffs2-analyzer" "jffs2-mount" "jffs2-fault-inject" "rag-case-retrieval")
 
 for skill in "${SKILLS[@]}"; do
@@ -255,7 +255,7 @@ fi
 echo ""
 echo "=== Installation Complete ==="
 echo ""
-echo "Installed Skills: 8"
+echo "Installed Skills: 9"
 echo "MCP Server: aicrasher"
 echo "Virtual Environment: $VENV_DIR"
 echo ""
@@ -263,9 +263,19 @@ echo "Quick Start:"
 echo "  /vmcore-analyzer <vmcore> <vmlinux>"
 echo "  /lock-analyzer <lock-addr> --type mutex"
 echo "  /kernel-build JFFS2_FS --arch arm64"
+echo "  /kernel-fault-injection nullptr --arch x86_64"
 echo ""
 echo "Documentation: docs/*.md"
 echo ""
+
+# Optional: crash-vmcore toolkit info
+CRASH_TOOLKIT="$PROJECT_DIR/tools/crash-vmcore"
+if [ -d "$CRASH_TOOLKIT" ]; then
+    echo "Crash-vmcore Toolkit:"
+    echo "  Build crash 9.0.2+: bash $CRASH_TOOLKIT/scripts/build_crash.sh"
+    echo "  See: $CRASH_TOOLKIT/README.md"
+    echo ""
+fi
 
 # Verify MCP
 if [ "$CLI" = "claude" ]; then

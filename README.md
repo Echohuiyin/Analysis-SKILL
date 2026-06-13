@@ -9,6 +9,7 @@ Claude Code skills for kernel development and debugging.
 | vmcore-analyzer | Vmcore crash dump analysis (7-phase workflow) | MCP Server |
 | lock-analyzer | Kernel lock analysis (mutex/spinlock/semaphore) | MCP Server |
 | kernel-build | Compile kernels with custom configs | GCC toolchain |
+| kernel-fault-injection | Inject kernel faults → generate vmcore | kernel-build, qemu-test |
 | qemu-test | Boot kernels in QEMU for testing | QEMU, busybox |
 | jffs2-analyzer | Static analysis of JFFS2 images | Python |
 | jffs2-mount | Mount JFFS2 in QEMU | QEMU, kernel |
@@ -34,9 +35,10 @@ Before running install.sh, ensure:
 |-------------|---------------|-------|
 | Python 3.10+ | `python3 --version` | Required for all skills |
 | Claude CLI | `which claude` | Install from [claude.ai/code](https://claude.ai/code) |
-| crash utility | `which crash` | Required for vmcore/lock analysis |
+| crash utility | `which crash` | Required for vmcore/lock analysis (9.0.2+ for QEMU vmcore) |
 | GCC toolchain | `which gcc` | Required for kernel-build |
-| QEMU | `which qemu-system-*` | Required for qemu-test |
+| QEMU | `which qemu-system-*` | Required for qemu-test, kernel-fault-injection |
+| socat | `which socat` | Required for QEMU monitor communication |
 | (Optional) Ollama | `which ollama` | For local embedding (RAG) |
 
 **RAG Skill Specific**:
@@ -54,7 +56,7 @@ bash scripts/install.sh
 This script automatically:
 1. Creates a Python virtual environment (`.venv`) and installs the MCP package
 2. Registers the `aicrasher` MCP server (supports both `claude` and `codebuddy` CLI tools)
-3. Installs all 8 skills to the appropriate skills directory
+3. Installs all 9 skills to the appropriate skills directory
 4. Creates `.env` from `.env.example` if not present
 5. Installs chromadb for RAG (uses local PersistentClient mode, no Docker required)
 6. (Optional) Checks Ollama for local embedding
@@ -131,6 +133,9 @@ cp .env.example .env
 # Kernel build
 /kernel-build JFFS2_FS --arch arm64 --cross
 
+# Kernel fault injection (generate vmcore)
+/kernel-fault-injection nullptr --arch x86_64
+
 # QEMU test
 /qemu-test --arch arm64 --kernel arch/arm64/boot/Image
 
@@ -147,9 +152,11 @@ python ~/.claude/skills/rag-case-retrieval/scripts/retrieve_cases.py "kernel pan
 - [vmcore-analyzer](docs/vmcore-analyzer-guide.md)
 - [lock-analyzer](docs/lock-analyzer-guide.md)
 - [kernel-build](docs/kernel-build-guide.md)
+- [kernel-fault-injection](skills/kernel-fault-injection/SKILL.md)
 - [qemu-test](docs/qemu-test-guide.md)
 - [jffs2-skills](docs/jffs2-guide.md)
 - [rag-case-retrieval](docs/rag-case-retrieval-guide.md)
+- [crash-vmcore toolkit](tools/crash-vmcore/README.md) — QEMU vmcore generation guide
 
 ## Requirements
 
