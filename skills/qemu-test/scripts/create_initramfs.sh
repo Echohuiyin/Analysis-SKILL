@@ -139,9 +139,10 @@ fi
 
 # Create busybox symlinks
 cd "$OUTPUT_DIR/bin"
-for cmd in sh cat ls mkdir mount umount echo sleep poweroff reboot dmesg grep \
+for cmd in sh ash cat ls mkdir mount umount echo sleep poweroff reboot dmesg grep \
            uname lsmod insmod rmmod modprobe ifconfig ip route ping wget curl \
-           vi less more head tail wc awk sed tr cut sort uniq diff find xargs; do
+           vi less more head tail wc awk sed tr cut sort uniq diff find xargs \
+           test "[" "bracket" true false; do
     ln -sf busybox "$cmd" 2>/dev/null || true
 done
 cd -
@@ -155,80 +156,55 @@ cat > "$INIT_SCRIPT" << 'EOF'
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || {
-    # Fallback: create minimal device nodes
     mknod /dev/console c 5 1
     mknod /dev/null c 1 3
     mknod /dev/tty c 5 0
 }
 
-# Setup basic environment
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export HOME=/root
-export TERM=linux
 
 echo
 echo "========================================="
 echo "  Minimal Initramfs for Kernel Testing"
 echo "========================================="
 echo
-echo "Kernel: $(uname -r)"
-echo "Architecture: $(uname -m)"
-echo "Boot time: $(date)"
+uname -r
+uname -m
 echo
 
-# Show kernel messages (last 20 lines)
+# Show recent kernel messages
 echo "Recent kernel messages:"
-dmesg | tail -20
+dmesg | tail -n 20
 echo
 
 # Load modules if provided
-if [ -d /modules ] && [ "$(ls -A /modules 2>/dev/null)" ]; then
+if ls /modules/*.ko 2>/dev/null; then
     echo "Loading kernel modules..."
     for mod in /modules/*.ko; do
-        if [ -f "$mod" ]; then
-            insmod "$mod"
-            echo "  Loaded: $(basename $mod)"
-        fi
+        insmod "$mod"
+        echo "  Loaded: $mod"
     done
     echo
 fi
 
 # Execute test script if provided
-TEST_STATUS=0
-if [ -f /test.sh ]; then
+if test -f /test.sh; then
     echo "========================================="
     echo "  Running Test Script"
     echo "========================================="
     echo
     sh /test.sh
-    TEST_STATUS=$?
-    echo
-    echo "Test completed with status: $TEST_STATUS"
     echo
 fi
 
 # Interactive mode or shutdown
-if [ "$INTERACTIVE" = "1" ]; then
-    echo "========================================="
-    echo "  Interactive Mode"
-    echo "========================================="
-    echo
-    echo "Type 'poweroff' or 'reboot' to exit."
-    echo "Available commands: sh, ls, cat, dmesg, etc."
-    echo
+if test "$INTERACTIVE" = "1"; then
+    echo "Interactive mode - type 'poweroff' to exit"
     exec /bin/sh
 else
-    echo "========================================="
-    echo "  Automated Test Complete"
-    echo "========================================="
-    echo "Test status: $TEST_STATUS"
-    echo "Shutting down..."
-    echo
-
-    # Give some time for output to be captured
+    echo "Automated test complete"
     sleep 2
-
-    # Power off
     poweroff -f
 fi
 EOF

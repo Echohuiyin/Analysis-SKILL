@@ -7,7 +7,8 @@ Guidance for Claude Code when working with this repository.
 ```
 Analysis-SKILL/
 ├── src/aicrasher/      # MCP Server (9 tools)
-├── skills/             # 9 Claude Code skills
+├── skills/             # 10 Claude Code skills
+├── tools/              # crash-vmcore toolkit
 ├── docs/               # Skill guides
 ├── scripts/            # install.sh, crash_report_generator.py
 └── pyproject.toml      # Python package config
@@ -20,6 +21,7 @@ Analysis-SKILL/
 | vmcore-analyzer | Yes | Vmcore analysis |
 | lock-analyzer | Yes | Lock debugging |
 | kernel-build | No | Kernel compilation |
+| kernel-fault-injection | No | Fault injection → vmcore generation |
 | kernel-testcase-generator | No | Generate reproduction test cases |
 | kernel-test-validator | No | Validate reproduction in QEMU |
 | qemu-test | No | QEMU testing |

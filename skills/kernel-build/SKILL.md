@@ -50,6 +50,7 @@ Examples:
 - `/kernel-build ARM64_MPAM --arch arm64 --cross` - Cross-compile for ARM64 from x86_64 host
 - `/kernel-build JFFS2_FS --arch arm32 --defconfig bcm2835_defconfig` - ARM32 with custom defconfig
 - `/kernel-build UB --arch arm64 --jobs 64 --cross` - Cross-compile with 64 threads
+- `/kernel-build FW_CFG_SYSFS DEBUG_INFO_DWARF4 PANIC_ON_OOPS --arch x86_64 --vmcore` - Build for QEMU vmcore analysis
 
 ## Parameters
 
@@ -310,6 +311,24 @@ if [ -z "$matches" ]; then
     exit 1
 fi
 ```
+
+### Vmcore Analysis Configs (QEMU Compatible)
+
+For building kernels that work with QEMU `dump-guest-memory` and crash analysis:
+
+```bash
+# Required configs for QEMU vmcore support
+FW_CFG_SYSFS=y          # QEMU fw_cfg interface (enables vmcoreinfo)
+FW_CFG_SYSFS_CMDLINE=y  # fw_cfg command line support
+CRASH_CORE=y            # Crash kernel core functionality
+DEBUG_INFO_DWARF4=y     # Debug symbols (DWARF4 format)
+PANIC_ON_OOPS=y         # Panic on kernel oops
+
+# Example: Build kernel for QEMU vmcore testing
+/kernel-build FW_CFG_SYSFS FW_CFG_SYSFS_CMDLINE DEBUG_INFO_DWARF4 PANIC_ON_OOPS CRASH_CORE --arch x86_64
+```
+
+**Important**: These configs enable the kernel to communicate with QEMU's vmcoreinfo device, which embeds `NT_VMCOREINFO` ELF notes in memory dumps. This is essential for crash 9.0.2+ to analyze QEMU-generated vmcores.
 
 ## Output Report
 

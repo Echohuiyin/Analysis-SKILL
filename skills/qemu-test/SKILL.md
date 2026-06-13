@@ -33,6 +33,7 @@ Options:
   --timeout <seconds>    Timeout for automated tests (default: 300)
   --log                  Collect boot/kernel logs
   --output <dir>         Output directory for artifacts
+  --vmcore               Enable vmcoreinfo device for crash analysis
 ```
 
 Examples:
@@ -40,6 +41,7 @@ Examples:
 - `/qemu-test --script tests/ub_test.sh --timeout 120` - Run test script
 - `/qemu-test --cmd "dmesg | grep UB"` - Execute command and collect output
 - `/qemu-test --kernel arch/x86/boot/bzImage --arch x86_64` - Boot specific kernel
+- `/qemu-test --arch x86_64 --vmcore --script crash_test.sh` - Boot for vmcore capture
 
 ## Architecture Support
 
@@ -195,13 +197,40 @@ qemu-system-arm \
 **x86_64**:
 ```bash
 qemu-system-x86_64 \
+    -M q35,dump-guest-core=on \  # q35 machine type for proper ELF format
     -smp 2 \
     -m 512M \
     -nographic \
     -kernel $KERNEL_IMAGE \
     -initrd $INITRAMFS \
-    -append "console=ttyS0 root=/dev/ram rw"
+    -append "console=ttyS0 panic=10 oops=panic"
 ```
+
+### Vmcore Capture Mode (--vmcore)
+
+For kernels built with `FW_CFG_SYSFS` and crash analysis support:
+
+```bash
+# x86_64 with vmcoreinfo device (crash 9.0.2+ compatible)
+qemu-system-x86_64 \
+    -M q35,dump-guest-core=on \
+    -device vmcoreinfo \        # Enables NT_VMCOREINFO ELF note
+    -smp 2 \
+    -m 512M \
+    -nographic \
+    -kernel $KERNEL_IMAGE \
+    -initrd $INITRAMFS \
+    -append "console=ttyS0 panic=10 oops=panic" \
+    -monitor unix:/tmp/qemu.sock,server,nowait
+
+# Capture vmcore after crash
+echo "dump-guest-memory /tmp/vmcore.elf" | socat - UNIX-CONNECT:/tmp/qemu.sock
+```
+
+**Important Requirements**:
+1. Kernel must be built with `CONFIG_FW_CFG_SYSFS=y` (use `/kernel-build` with FW_CFG_SYSFS)
+2. Use crash 9.0.2+ for analysis (older versions may segfault on QEMU dumps)
+3. See `docs/qemu_vmcore_generation.md` for complete guide
 
 ### Step 4: Execute QEMU
 
