@@ -1,0 +1,3 @@
+# Crash binary is 176MB - too large for git
+# Build it locally using scripts/build_crash.sh
+crash
