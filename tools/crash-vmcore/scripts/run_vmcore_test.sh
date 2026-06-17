@@ -1,6 +1,6 @@
 #!/bin/bash
 # run_vmcore_test.sh - Run QEMU test with vmcore capture
-# Usage: ./run_vmcore_test.sh <test_name> <kernel> <initramfs> [timeout]
+# Usage: ./run_vmcore_test.sh <test_name> <kernel> <initramfs> [timeout] [--output <dir>]
 #
 # Generates vmcore compatible with crash 9.0.2+ analysis
 
@@ -14,13 +14,32 @@ TEST_NAME="$1"
 KERNEL_IMAGE="$2"
 INITRAMFS="$3"
 TIMEOUT="${4:-60}"
+OUTPUT_DIR=""
+
+# Parse additional arguments
+shift 4 2>/dev/null || true
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --output)
+            OUTPUT_DIR="$2"
+            shift 2
+        ;;
+        *)
+            shift
+        ;;
+    esac
+done
 
 if [ -z "$TEST_NAME" ] || [ -z "$KERNEL_IMAGE" ]; then
-    echo "Usage: $0 <test_name> <kernel> <initramfs> [timeout]"
+    echo "Usage: $0 <test_name> <kernel> <initramfs> [timeout] [--output <dir>]"
     exit 1
 fi
 
-OUTPUT_DIR="${PROJECT_ROOT}/test_outputs/${TEST_NAME}"
+# Set output directory (use --output if provided, otherwise default)
+if [ -z "$OUTPUT_DIR" ]; then
+    OUTPUT_DIR="${PROJECT_ROOT}/test_outputs/${TEST_NAME}"
+fi
+
 VMCORE_FILE="${OUTPUT_DIR}/vmcore.elf"
 LOG_FILE="${OUTPUT_DIR}/boot.log"
 MONITOR_SOCKET="${OUTPUT_DIR}/qemu_monitor.sock"
@@ -98,7 +117,7 @@ $QEMU_CMD \
     -nographic \
     -kernel "$KERNEL_IMAGE" \
     -initrd "$INITRAMFS" \
-    -append "console=${CONSOLE} panic=10 oops=panic hung_task_panic=1" \
+    -append "console=${CONSOLE} panic=10 oops=panic hung_task_panic=1 hung_task_timeout_secs=60" \
     -monitor unix:${MONITOR_SOCKET},server,nowait \
     > "$LOG_FILE" 2>&1 &
 

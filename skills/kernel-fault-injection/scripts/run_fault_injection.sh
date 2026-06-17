@@ -171,9 +171,10 @@ if [ -f "${PROJECT_ROOT}/tools/crash-vmcore/scripts/run_vmcore_test.sh" ]; then
         "${FAULT_TYPE}_${ARCH}" \
         "$KERNEL" \
         "$INITRAMFS" \
-        "$TIMEOUT"
+        "$TIMEOUT" \
+        --output "$OUTPUT_DIR"
 
-    VMCORE="${PROJECT_ROOT}/test_outputs/${FAULT_TYPE}_${ARCH}/vmcore.elf"
+    VMCORE="${OUTPUT_DIR}/vmcore.elf"
 else
     echo "ERROR: run_vmcore_test.sh not found"
     exit 1

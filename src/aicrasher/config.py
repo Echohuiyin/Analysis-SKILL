@@ -82,6 +82,38 @@ def _get_optional_str(key: str) -> Optional[str]:
     return value if value else None
 
 
+def _detect_crash_binary() -> str:
+    """Detect crash binary with priority for source-built 9.0.2+ version.
+
+    Priority order:
+    1. Environment variable CRASH_BINARY (if set)
+    2. Source-built crash in common locations (9.0.2+ for QEMU vmcore)
+    3. System crash binary (fallback)
+
+    Returns:
+        Path to crash binary
+    """
+    # 1. Check environment variable first
+    env_crash = os.getenv("CRASH_BINARY")
+    if env_crash and Path(env_crash).exists():
+        return env_crash
+
+    # 2. Check source-built crash in common locations
+    project_root = Path(__file__).resolve().parent.parent.parent
+    source_candidates = [
+        project_root / "tools/crash-vmcore/bin/crash",
+        Path.home() / "crash/crash",
+        Path.home() / "code/Analysis-SKILL/tools/crash-vmcore/bin/crash",
+    ]
+
+    for candidate in source_candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    # 3. Fallback to system crash
+    return "crash"
+
+
 class AppConfig(BaseModel):
     """Application-level configuration loaded from environment variables.
     
@@ -134,8 +166,8 @@ class AppConfig(BaseModel):
 
     # ==================== Crash Utility Settings ====================
     crash_binary: str = Field(
-        default_factory=lambda: _get_str("CRASH_BINARY", "crash"),
-        description="Path to the crash CLI utility.",
+        default_factory=_detect_crash_binary,
+        description="Path to the crash CLI utility (auto-detected, prefers 9.0.2+ for QEMU vmcore).",
     )
     crash_timeout_seconds: int = Field(
         default_factory=lambda: _get_int("CRASH_TIMEOUT_SECONDS", 300),
