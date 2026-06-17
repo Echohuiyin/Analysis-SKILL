@@ -216,7 +216,7 @@ fi
 # Check crash evidence
 echo "" >> "$SUMMARY"
 echo "=== Crash Evidence ===" >> "$SUMMARY"
-BOOT_LOG="${PROJECT_ROOT}/test_outputs/${FAULT_TYPE}_${ARCH}/boot.log"
+BOOT_LOG="${OUTPUT_DIR}/boot.log"
 
 if [ -f "$BOOT_LOG" ]; then
     grep -E "Kernel panic|Oops|NULL pointer|soft lockup|blocked for more than|BUG" "$BOOT_LOG" | head -5 >> "$SUMMARY" || echo "No crash pattern found" >> "$SUMMARY"
