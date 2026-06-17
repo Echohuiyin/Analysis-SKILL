@@ -97,6 +97,12 @@ if [ -z "$KERNEL" ]; then
         echo "Please run: /kernel-build ... --arch ${ARCH}"
         exit 1
     fi
+
+    # Copy vmlinux to output directory for crash analysis
+    if [ -f "$VMLINUX" ]; then
+        cp "$VMLINUX" "$OUTPUT_DIR/vmlinux"
+        echo "✓ Vmlinux copied to: $OUTPUT_DIR/vmlinux"
+    fi
 else
     echo "[1/5] Using pre-built kernel: $KERNEL"
 fi
