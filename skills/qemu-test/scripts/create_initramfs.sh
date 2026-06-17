@@ -164,9 +164,6 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || {
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export HOME=/root
 
-# Set hung_task timeout to 60 seconds for faster deadlock detection
-echo 60 > /proc/sys/kernel/hung_task_timeout_secs 2>/dev/null || true
-
 echo
 echo "========================================="
 echo "  Minimal Initramfs for Kernel Testing"

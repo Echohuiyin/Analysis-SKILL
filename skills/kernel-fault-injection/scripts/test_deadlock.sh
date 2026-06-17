@@ -2,15 +2,19 @@
 # test_deadlock.sh - Initramfs test script for mutex ABBA deadlock
 # This runs inside QEMU guest
 # NOTE: Kernel must be configured with BOOTPARAM_HUNG_TASK_PANIC=y
-# Hung task will trigger panic after 120 seconds, capturing vmcore
+# Hung task will trigger panic after timeout, capturing vmcore
 
 echo "=== Mutex ABBA Deadlock Test ==="
 echo "Loading crash_deadlock module..."
-echo "Two threads will deadlock, hung task detector will find after 120s and trigger panic"
+echo "Two threads will deadlock, hung task detector will find and trigger panic"
 echo "This script will wait indefinitely - kernel panic will terminate QEMU"
+
+# Set hung_task timeout for this specific test (60 seconds for deadlock)
+echo 60 > /proc/sys/kernel/hung_task_timeout_secs
 
 # Enable hung_task panic (should be already enabled via kernel config)
 echo 1 > /proc/sys/kernel/hung_task_panic
+
 echo "hung_task_panic enabled: $(cat /proc/sys/kernel/hung_task_panic)"
 echo "hung_task_timeout: $(cat /proc/sys/kernel/hung_task_timeout_secs) seconds"
 
@@ -18,7 +22,7 @@ echo "hung_task_timeout: $(cat /proc/sys/kernel/hung_task_timeout_secs) seconds"
 insmod /modules/crash_deadlock.ko
 
 echo "Module loaded, threads deadlocked"
-echo "Waiting for hung task detection (120s) and kernel panic..."
+echo "Waiting for hung task detection and kernel panic..."
 echo "DO NOT EXIT - let kernel panic capture vmcore"
 
 # Wait indefinitely - kernel panic will terminate QEMU and capture vmcore
@@ -30,5 +34,5 @@ echo "WARNING: No panic after 180s - hung_task may not be enabled"
 echo "Manual poweroff"
 poweroff -f
 
-# Threads are deadlocked, hung_task will panic after 120s
+# Threads are deadlocked, hung_task will panic after timeout
 # No need to sleep - kernel will panic and kdump captures vmcore
