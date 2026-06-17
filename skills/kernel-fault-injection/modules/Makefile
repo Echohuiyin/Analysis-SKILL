@@ -7,6 +7,9 @@ obj-m += crash_deadlock.o
 obj-m += crash_panic.o
 obj-m += crash_stack_overflow.o
 
+# Disable infinite recursion warning for stack_overflow module (intentional for fault injection)
+ccflags-y := -Wno-infinite-recursion
+
 # Default kernel directory
 KDIR ?= /lib/modules/$(shell uname -r)/build
 

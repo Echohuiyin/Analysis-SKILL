@@ -36,7 +36,18 @@ echo "Timeout: $TIMEOUT seconds"
 echo
 
 # Check kernel architecture
-KERNEL_ARCH=$(file "$KERNEL_IMAGE" | grep -oE "x86-64|ARM aarch64|ARM,")
+# bzImage format: "Linux kernel x86 boot executable bzImage"
+# ELF format: "ELF 64-bit LSB executable, x86-64"
+KERNEL_INFO=$(file "$KERNEL_IMAGE")
+
+if echo "$KERNEL_INFO" | grep -qE "x86 boot executable|x86-64"; then
+    KERNEL_ARCH="x86-64"
+elif echo "$KERNEL_INFO" | grep -qE "ARM aarch64|ARM,"; then
+    KERNEL_ARCH="ARM aarch64"
+else
+    echo "ERROR: Unknown kernel architecture: $KERNEL_INFO"
+    exit 1
+fi
 
 if [ "$KERNEL_ARCH" = "x86-64" ]; then
     QEMU_CMD="qemu-system-x86_64"
@@ -87,7 +98,7 @@ $QEMU_CMD \
     -nographic \
     -kernel "$KERNEL_IMAGE" \
     -initrd "$INITRAMFS" \
-    -append "console=${CONSOLE} panic=10 oops=panic" \
+    -append "console=${CONSOLE} panic=10 oops=panic hung_task_panic=1" \
     -monitor unix:${MONITOR_SOCKET},server,nowait \
     > "$LOG_FILE" 2>&1 &
 

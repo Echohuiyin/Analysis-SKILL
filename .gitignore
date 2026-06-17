@@ -1,0 +1,42 @@
+# Environment
+.env
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Kernel module build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+.modules.order
+Module.symvers
+modules.order
+.*.cmd
+
+# Test outputs
+test_outputs/
+test_modules/
+test.sh
+init
+bin/
+
+# Prebuilt binaries
+tools/busybox/prebuilt/
+tools/crash/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

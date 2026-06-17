@@ -12,14 +12,15 @@ MODULE_DESCRIPTION("Fault injection: Stack overflow via recursion");
 // Recursive function to overflow stack
 static noinline int recursive_overflow(int depth)
 {
-	volatile char buffer[256]; // Waste stack space
+	char buffer[256]; // Waste stack space
 
 	// Touch buffer to prevent optimization
-	memset(buffer, depth & 0xFF, sizeof(buffer));
+	memset((void *)buffer, depth & 0xFF, sizeof(buffer));
 
 	printk(KERN_INFO "Recursion depth: %d\n", depth);
 
-	// Continue recursion until stack overflow
+	// Continue recursion until stack overflow (intentional infinite recursion for testing)
+	// NOLINTNEXTLINE: infinite-recursion - intentional for fault injection testing
 	return recursive_overflow(depth + 1);
 }
 

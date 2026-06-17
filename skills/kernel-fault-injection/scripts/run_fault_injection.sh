@@ -79,14 +79,17 @@ if [ -z "$KERNEL" ]; then
     # Call kernel-build skill
     if [ -f "${PROJECT_ROOT}/skills/kernel-build/SKILL.md" ]; then
         echo "Using /kernel-build skill..."
-        echo "/kernel-build FW_CFG_SYSFS FW_CFG_SYSFS_CMDLINE DEBUG_INFO_DWARF4 PANIC_ON_OOPS CRASH_CORE KEXEC PROC_VMCORE DETECT_SOFTLOCKUP BOOTPARAM_SOFTLOCKUP_PANIC DETECT_HUNG_TASK DEFAULT_HUNG_TASK_TIMEOUT --arch ${ARCH} --jobs 32"
+        echo "/kernel-build FW_CFG_SYSFS FW_CFG_SYSFS_CMDLINE DEBUG_INFO_DWARF4 PANIC_ON_OOPS CRASH_CORE KEXEC PROC_VMCORE DETECT_SOFTLOCKUP BOOTPARAM_SOFTLOCKUP_PANIC DETECT_HUNG_TASK DEFAULT_HUNG_TASK_TIMEOUT BOOTPARAM_HUNG_TASK_PANIC --arch ${ARCH} --jobs 32"
     fi
 
     # Check kernel output
     if [ "$ARCH" = "x86_64" ]; then
-        KERNEL="${KERNEL_DIR}/vmlinux"
+        # QEMU needs bzImage for booting, vmlinux is for crash analysis
+        KERNEL="${KERNEL_DIR}/arch/x86/boot/bzImage"
+        VMLINUX="${KERNEL_DIR}/vmlinux"
     elif [ "$ARCH" = "arm64" ]; then
         KERNEL="${KERNEL_DIR}/arch/arm64/boot/Image"
+        VMLINUX="${KERNEL_DIR}/vmlinux"
     fi
 
     if [ ! -f "$KERNEL" ]; then
@@ -216,7 +219,13 @@ fi
 echo "" >> "$SUMMARY"
 echo "=== Next Steps ===" >> "$SUMMARY"
 echo "Analyze vmcore with:" >> "$SUMMARY"
-echo "  /vmcore-analyzer $KERNEL $VMCORE" >> "$SUMMARY"
+# Use vmlinux for crash analysis, not bzImage
+if [ "$ARCH" = "x86_64" ]; then
+    CRASH_KERNEL="${KERNEL_DIR}/vmlinux"
+else
+    CRASH_KERNEL="${KERNEL_DIR}/vmlinux"
+fi
+echo "  /vmcore-analyzer $CRASH_KERNEL $VMCORE" >> "$SUMMARY"
 echo "" >> "$SUMMARY"
 echo "Or use crash directly:" >> "$SUMMARY"
 echo "  ${PROJECT_ROOT}/tools/crash-vmcore/bin/crash $KERNEL $VMCORE" >> "$SUMMARY"

@@ -178,17 +178,7 @@ echo "Recent kernel messages:"
 dmesg | tail -n 20
 echo
 
-# Load modules if provided
-if ls /modules/*.ko 2>/dev/null; then
-    echo "Loading kernel modules..."
-    for mod in /modules/*.ko; do
-        insmod "$mod"
-        echo "  Loaded: $mod"
-    done
-    echo
-fi
-
-# Execute test script if provided
+# Check if test.sh exists - it handles module loading
 if test -f /test.sh; then
     echo "========================================="
     echo "  Running Test Script"
@@ -196,16 +186,28 @@ if test -f /test.sh; then
     echo
     sh /test.sh
     echo
-fi
-
-# Interactive mode or shutdown
-if test "$INTERACTIVE" = "1"; then
-    echo "Interactive mode - type 'poweroff' to exit"
-    exec /bin/sh
+    # Test script should handle everything including shutdown
+    # Don't auto-poweroff - let test.sh or kernel panic handle it
 else
-    echo "Automated test complete"
-    sleep 2
-    poweroff -f
+    # No test script - load modules if provided
+    if ls /modules/*.ko 2>/dev/null; then
+        echo "Loading kernel modules..."
+        for mod in /modules/*.ko; do
+            insmod "$mod"
+            echo "  Loaded: $mod"
+        done
+        echo
+    fi
+
+    # Interactive mode or shutdown
+    if test "$INTERACTIVE" = "1"; then
+        echo "Interactive mode - type 'poweroff' to exit"
+        exec /bin/sh
+    else
+        echo "Automated test complete"
+        sleep 2
+        poweroff -f
+    fi
 fi
 EOF
 
