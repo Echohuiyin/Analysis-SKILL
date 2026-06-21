@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def _load_dotenv_from_multiple_locations(override: bool = False) -> None:
@@ -262,21 +262,24 @@ class AppConfig(BaseModel):
         attr_name = f"feature_{feature_name}"
         return getattr(self, attr_name, False)
 
-    @validator("workspace_root", pre=True)
+    @field_validator("workspace_root", mode="before")
+    @classmethod
     def _expand_workspace(cls, value):
         if isinstance(value, str):
             return Path(value).expanduser().resolve() if value else Path.cwd()
         return value
 
-    @validator("knowledge_base_paths", each_item=True, pre=True)
+    @field_validator("knowledge_base_paths", mode="before")
+    @classmethod
     def _expand_kb(cls, value):
-        if isinstance(value, str):
-            return Path(value).expanduser().resolve()
+        if isinstance(value, list):
+            return [
+                Path(v).expanduser().resolve() if isinstance(v, str) else v
+                for v in value
+            ]
         return value
 
-    class Config:
-        arbitrary_types_allowed = True
-        validate_assignment = True
+    model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True)
 
 
 # Global config instance (lazy loaded)
