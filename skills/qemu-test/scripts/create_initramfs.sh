@@ -242,6 +242,13 @@ cd "$OUTPUT_DIR"
 find . | cpio -o -H newc 2>/dev/null | gzip > "$OUTPUT_FILE"
 cd -
 
+# Verify archive was created successfully before cleanup
+if [ ! -s "$OUTPUT_FILE" ]; then
+    echo "ERROR: Initramfs creation failed - archive is empty or missing"
+    ls -la "$OUTPUT_FILE" 2>/dev/null || echo "Archive not found: $OUTPUT_FILE"
+    exit 1
+fi
+
 # Get size
 SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
 
@@ -253,9 +260,19 @@ echo "  Interactive: $INTERACTIVE"
 if [ -n "$TEST_SCRIPT" ]; then
     echo "  Test script: $(basename $TEST_SCRIPT)"
 fi
+
+# Verify init file is in archive
+if ! (zcat "$OUTPUT_FILE" 2>/dev/null | cpio -t 2>/dev/null | grep -q "^init$"); then
+    echo "ERROR: init file not found in initramfs archive"
+    echo "Archive contents:"
+    zcat "$OUTPUT_FILE" 2>/dev/null | cpio -t 2>/dev/null | head -20
+    exit 1
+fi
+echo "  Init file: ✓ present"
+
 echo
 
-# Cleanup
+# Cleanup (safe to do now - archive is complete and verified)
 rm -rf "$OUTPUT_DIR"
 
 exit 0

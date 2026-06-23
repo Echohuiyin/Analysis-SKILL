@@ -97,14 +97,17 @@ if [ -z "$KERNEL" ]; then
         echo "Please run: /kernel-build ... --arch ${ARCH}"
         exit 1
     fi
-
-    # Copy vmlinux to output directory for crash analysis
-    if [ -f "$VMLINUX" ]; then
-        cp "$VMLINUX" "$OUTPUT_DIR/vmlinux"
-        echo "✓ Vmlinux copied to: $OUTPUT_DIR/vmlinux"
-    fi
 else
     echo "[1/5] Using pre-built kernel: $KERNEL"
+fi
+
+# Always copy vmlinux to output directory for crash analysis (regardless of kernel build)
+VMLINUX="${KERNEL_DIR}/vmlinux"
+if [ -f "$VMLINUX" ]; then
+    cp "$VMLINUX" "$OUTPUT_DIR/vmlinux"
+    echo "✓ Vmlinux copied to: $OUTPUT_DIR/vmlinux"
+else
+    echo "WARNING: vmlinux not found at $VMLINUX"
 fi
 
 # Step 2: Build fault module
@@ -133,6 +136,8 @@ if [ ! -f "${MODULE_NAME}.ko" ]; then
     exit 1
 fi
 
+# Clean any stale modules and copy only the specific module
+rm -f "$OUTPUT_DIR"/*.ko 2>/dev/null || true
 cp "${MODULE_NAME}.ko" "$OUTPUT_DIR/"
 echo "✓ Module: ${OUTPUT_DIR}/${MODULE_NAME}.ko"
 

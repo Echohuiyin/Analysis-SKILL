@@ -90,27 +90,31 @@ if [ $INTERACTIVE -eq 0 ]; then
     CMDLINE="$CMDLINE panic=1"
 fi
 
-# QEMU command
-QEMU_CMD="qemu-system-x86_64 \
-    -smp $CPU_COUNT \
-    -m $MEMORY \
-    -nographic \
-    -kernel $KERNEL \
-    -initrd $INITRD \
-    -append \"$CMDLINE\""
-
 echo "Launching QEMU..."
 echo
 
-# Run QEMU
+# Run QEMU directly — no bash -c wrapper to avoid quoting issues with -append
 if [ $INTERACTIVE -eq 1 ]; then
-    eval $QEMU_CMD
+    qemu-system-x86_64 \
+        -smp "$CPU_COUNT" \
+        -m "$MEMORY" \
+        -nographic \
+        -kernel "$KERNEL" \
+        -initrd "$INITRD" \
+        -append "$CMDLINE"
 else
     LOG_FILE="/tmp/qemu_boot_$$_$(date +%s).log"
 
-    timeout "$TIMEOUT" bash -c "$QEMU_CMD" 2>&1 | tee "$LOG_FILE"
+    timeout "$TIMEOUT" qemu-system-x86_64 \
+        -smp "$CPU_COUNT" \
+        -m "$MEMORY" \
+        -nographic \
+        -kernel "$KERNEL" \
+        -initrd "$INITRD" \
+        -append "$CMDLINE" 2>&1 | tee "$LOG_FILE"
 
-    EXIT_STATUS=$?
+    # PIPESTATUS[0] = exit status of timeout (124=timeout, 0=success)
+    EXIT_STATUS=${PIPESTATUS[0]}
 
     echo
     echo "========================================="
