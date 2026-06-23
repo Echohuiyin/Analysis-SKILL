@@ -108,7 +108,7 @@ if [ $INTERACTIVE -eq 1 ]; then
 else
     LOG_FILE="/tmp/qemu_boot_$$_$(date +%s).log"
 
-    timeout "$TIMEOUT" eval $QEMU_CMD 2>&1 | tee "$LOG_FILE"
+    timeout "$TIMEOUT" bash -c "$QEMU_CMD" 2>&1 | tee "$LOG_FILE"
 
     EXIT_STATUS=$?
 
