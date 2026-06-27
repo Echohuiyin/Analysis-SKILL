@@ -27,6 +27,7 @@ Inject kernel faults in QEMU to generate vmcore files for crash analysis.
 | `deadlock` | Mutex ABBA deadlock | `blocked for more than 120 seconds` |
 | `panic` | Direct kernel panic | `Kernel panic` |
 | `stack-overflow` | Stack overflow via recursion | `stack-overflow` |
+| `uaf` | Use-after-free via kref refcount leak | `KASAN: use-after-free` |
 
 ## Examples
 
@@ -134,6 +135,24 @@ static int __init deadlock_init(void) {
 ```
 
 **Config**: `CONFIG_DETECT_HUNG_TASK=y`, `CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=120`
+
+### uaf - Use-After-Free via kref Refcount Leak
+
+```c
+struct uaf_object { struct kref refcnt; char data[64]; };
+static struct uaf_object *stale;  // stale pointer kept across free
+
+static long uaf_ioctl(...) {
+    case 0: obj = kzalloc(...); kref_init(&obj->refcnt); stale = obj;
+    case 1: kref_get(&obj->refcnt);  // leak: no matching put
+    case 2: kref_put(&obj->refcnt, uaf_release);  // frees obj; stale still points
+    case 3: memset(stale->data, 'X', ...);  // KASAN: use-after-free
+}
+```
+
+**Config**: `CONFIG_KASAN=y`, `CONFIG_KASAN_INLINE=y`, `CONFIG_KASAN_PANIC=y`
+
+**Trigger**: Requires userspace binary `uaf_trigger` (built automatically, injected via initramfs `--binaries`)
 
 ## QEMU Configuration
 
@@ -248,7 +267,9 @@ skills/kernel-fault-injection/
 │   ├── crash_softlockup.c
 │   ├── crash_deadlock.c
 │   ├── crash_panic.c
-│   └── crash_stack_overflow.c
+│   ├── crash_stack_overflow.c
+│   ├── crash_uaf.c
+│   └── uaf_trigger.c           # Userspace trigger for UAF
 ├── scripts/
 │   ├── run_fault_injection.sh  # Main entry point
 │   ├── create_initramfs.sh     # Create initramfs with module
@@ -256,5 +277,6 @@ skills/kernel-fault-injection/
 └── examples/
     ├── test_nullptr.sh
     ├── test_softlockup.sh
-    └── test_deadlock.sh
+    ├── test_deadlock.sh
+    └── test_uaf.sh
 ```

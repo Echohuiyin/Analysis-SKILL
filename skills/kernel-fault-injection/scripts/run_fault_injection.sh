@@ -19,7 +19,7 @@ KERNEL_DIR="/home/liumingrui/code/OLK-6.6"
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        nullptr|softlockup|deadlock|panic|stack-overflow)
+        nullptr|softlockup|deadlock|panic|stack-overflow|uaf)
             FAULT_TYPE="$1"
             shift
         ;;
@@ -53,7 +53,7 @@ done
 if [ -z "$FAULT_TYPE" ]; then
     echo "Usage: $0 <fault_type> [--arch x86_64|arm64] [--kernel <path>]"
     echo ""
-    echo "Fault types: nullptr, softlockup, deadlock, panic, stack-overflow"
+    echo "Fault types: nullptr, softlockup, deadlock, panic, stack-overflow, uaf"
     exit 1
 fi
 
@@ -79,7 +79,11 @@ if [ -z "$KERNEL" ]; then
     # Call kernel-build skill
     if [ -f "${PROJECT_ROOT}/skills/kernel-build/SKILL.md" ]; then
         echo "Using /kernel-build skill..."
-        echo "/kernel-build FW_CFG_SYSFS FW_CFG_SYSFS_CMDLINE DEBUG_INFO_DWARF4 PANIC_ON_OOPS CRASH_CORE KEXEC PROC_VMCORE DETECT_SOFTLOCKUP BOOTPARAM_SOFTLOCKUP_PANIC DETECT_HUNG_TASK DEFAULT_HUNG_TASK_TIMEOUT BOOTPARAM_HUNG_TASK_PANIC --arch ${ARCH} --jobs 32"
+        if [ "$FAULT_TYPE" = "uaf" ]; then
+            echo "/kernel-build FW_CFG_SYSFS FW_CFG_SYSFS_CMDLINE DEBUG_INFO_DWARF4 PANIC_ON_OOPS CRASH_CORE KEXEC PROC_VMCORE DETECT_SOFTLOCKUP BOOTPARAM_SOFTLOCKUP_PANIC DETECT_HUNG_TASK DEFAULT_HUNG_TASK_TIMEOUT BOOTPARAM_HUNG_TASK_PANIC KASAN KASAN_INLINE KASAN_PANIC --arch ${ARCH} --jobs 32"
+        else
+            echo "/kernel-build FW_CFG_SYSFS FW_CFG_SYSFS_CMDLINE DEBUG_INFO_DWARF4 PANIC_ON_OOPS CRASH_CORE KEXEC PROC_VMCORE DETECT_SOFTLOCKUP BOOTPARAM_SOFTLOCKUP_PANIC DETECT_HUNG_TASK DEFAULT_HUNG_TASK_TIMEOUT BOOTPARAM_HUNG_TASK_PANIC --arch ${ARCH} --jobs 32"
+        fi
     fi
 
     # Check kernel output
@@ -141,6 +145,26 @@ rm -f "$OUTPUT_DIR"/*.ko 2>/dev/null || true
 cp "${MODULE_NAME}.ko" "$OUTPUT_DIR/"
 echo "✓ Module: ${OUTPUT_DIR}/${MODULE_NAME}.ko"
 
+# Build userspace trigger binary if applicable (uaf only)
+BINARIES_DIR=""
+if [ "$FAULT_TYPE" = "uaf" ]; then
+    echo "Building uaf_trigger userspace binary..."
+    if [ "$ARCH" = "x86_64" ]; then
+        gcc -static -o "${MODULES_DIR}/uaf_trigger" "${MODULES_DIR}/uaf_trigger.c" 2>/dev/null || \
+            cc -static -o "${MODULES_DIR}/uaf_trigger" "${MODULES_DIR}/uaf_trigger.c"
+    elif [ "$ARCH" = "arm64" ]; then
+        aarch64-linux-gnu-gcc -static -o "${MODULES_DIR}/uaf_trigger" "${MODULES_DIR}/uaf_trigger.c"
+    fi
+    if [ -x "${MODULES_DIR}/uaf_trigger" ]; then
+        mkdir -p "$OUTPUT_DIR/binaries"
+        cp "${MODULES_DIR}/uaf_trigger" "$OUTPUT_DIR/binaries/"
+        BINARIES_DIR="$OUTPUT_DIR/binaries"
+        echo "✓ Trigger binary: ${OUTPUT_DIR}/binaries/uaf_trigger"
+    else
+        echo "WARNING: uaf_trigger not built, UAF will not be triggered in QEMU"
+    fi
+fi
+
 # Step 3: Create initramfs
 echo
 echo "[3/5] Creating initramfs with fault module..."
@@ -149,11 +173,16 @@ INITRAMFS="${OUTPUT_DIR}/initramfs.cpio.gz"
 
 # Use create_initramfs script
 if [ -f "${PROJECT_ROOT}/skills/qemu-test/scripts/create_initramfs.sh" ]; then
-    bash "${PROJECT_ROOT}/skills/qemu-test/scripts/create_initramfs.sh" \
-        --arch "$ARCH" \
-        --modules "$OUTPUT_DIR" \
-        --test-script "${MODULES_DIR}/../scripts/test_${FAULT_TYPE}.sh" \
+    INITRAMFS_ARGS=(
+        --arch "$ARCH"
+        --modules "$OUTPUT_DIR"
+        --test-script "${MODULES_DIR}/../scripts/test_${FAULT_TYPE}.sh"
         --output "$INITRAMFS"
+    )
+    if [ -n "$BINARIES_DIR" ]; then
+        INITRAMFS_ARGS+=(--binaries "$BINARIES_DIR")
+    fi
+    bash "${PROJECT_ROOT}/skills/qemu-test/scripts/create_initramfs.sh" "${INITRAMFS_ARGS[@]}"
 else
     echo "ERROR: create_initramfs.sh not found"
     exit 1

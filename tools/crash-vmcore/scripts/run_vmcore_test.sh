@@ -117,7 +117,7 @@ $QEMU_CMD \
     -nographic \
     -kernel "$KERNEL_IMAGE" \
     -initrd "$INITRAMFS" \
-    -append "console=${CONSOLE} panic=10 oops=panic hung_task_panic=1 hung_task_timeout_secs=60" \
+    -append "console=${CONSOLE} panic=10 oops=panic hung_task_panic=1 hung_task_timeout_secs=60 kasan.fault=panic" \
     -monitor unix:${MONITOR_SOCKET},server,nowait \
     > "$LOG_FILE" 2>&1 &
 

@@ -15,6 +15,7 @@ OUTPUT_FILE="/tmp/initramfs_${ARCH}.cpio.gz"
 TEST_SCRIPT=""
 MODULES_DIR=""
 INTERACTIVE=0
+BINARIES_DIR=""
 
 # 架构映射
 detect_busybox_arch() {
@@ -74,6 +75,10 @@ while [[ $# -gt 0 ]]; do
         ;;
         --modules)
             MODULES_DIR="$2"
+            shift 2
+        ;;
+        --binaries)
+            BINARIES_DIR="$2"
             shift 2
         ;;
         --interactive)
@@ -224,6 +229,13 @@ fi
 if [ -n "$MODULES_DIR" ] && [ -d "$MODULES_DIR" ]; then
     cp -r "$MODULES_DIR"/*.ko "$OUTPUT_DIR/modules/" 2>/dev/null || true
     echo "Modules included from: $MODULES_DIR"
+fi
+
+# Copy userspace binaries if provided
+if [ -n "$BINARIES_DIR" ] && [ -d "$BINARIES_DIR" ]; then
+    cp "$BINARIES_DIR"/* "$OUTPUT_DIR/bin/" 2>/dev/null || true
+    chmod +x "$OUTPUT_DIR/bin/"* 2>/dev/null || true
+    echo "Binaries included from: $BINARIES_DIR"
 fi
 
 # Set interactive flag in init

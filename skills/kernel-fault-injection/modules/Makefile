@@ -6,6 +6,7 @@ obj-m += crash_softlockup.o
 obj-m += crash_deadlock.o
 obj-m += crash_panic.o
 obj-m += crash_stack_overflow.o
+obj-m += crash_uaf.o
 
 # Disable infinite recursion warning for stack_overflow module (intentional for fault injection)
 ccflags-y := -Wno-infinite-recursion

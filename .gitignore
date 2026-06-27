@@ -20,6 +20,9 @@ Module.symvers
 modules.order
 .*.cmd
 
+# Userspace trigger binaries (built from .c, do not commit compiled binary)
+skills/kernel-fault-injection/modules/uaf_trigger
+
 # Test outputs
 test_outputs/
 outputs/
