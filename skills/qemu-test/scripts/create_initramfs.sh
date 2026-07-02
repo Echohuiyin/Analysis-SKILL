@@ -178,7 +178,7 @@ chmod 1777 /tmp
 # and busybox may lack mknod. Static nodes from initramfs archive are
 # hidden when devtmpfs mounts on top, so create them here.)
 mknod /dev/loop-control c 10 237 2>/dev/null || true
-for i in 0 1 2 3 4 5 6 7; do
+for i in $(seq 0 31); do
     mknod /dev/loop${i} b 7 ${i} 2>/dev/null || true
 done
 
@@ -263,7 +263,7 @@ fi
 mknod "$OUTPUT_DIR/dev/console" c 5 1 2>/dev/null || true
 mknod "$OUTPUT_DIR/dev/null" c 1 3 2>/dev/null || true
 mknod "$OUTPUT_DIR/dev/tty" c 5 0 2>/dev/null || true
-for i in 0 1 2 3 4 5 6 7; do
+for i in $(seq 0 31); do
     mknod "$OUTPUT_DIR/dev/loop${i}" b 7 ${i} 2>/dev/null || true
 done
 mknod "$OUTPUT_DIR/dev/loop-control" c 10 237 2>/dev/null || true
