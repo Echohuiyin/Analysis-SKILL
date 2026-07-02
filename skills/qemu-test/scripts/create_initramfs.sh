@@ -166,6 +166,14 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || {
     mknod /dev/tty c 5 0
 }
 
+# Create essential writable dirs before test.sh runs. LLM-generated
+# reproducers frequently redirect stdout to /tmp/repro.log or write
+# scratch files under /run /var/tmp /root — if these don't exist the
+# redirect fails silently, repro_c never starts, and init exits with
+# "Attempted to kill init" panic that masquerades as a test failure.
+mkdir -p /tmp /run /var/tmp /root
+chmod 1777 /tmp
+
 # Create loop device nodes (devtmpfs doesn't create them dynamically,
 # and busybox may lack mknod. Static nodes from initramfs archive are
 # hidden when devtmpfs mounts on top, so create them here.)
