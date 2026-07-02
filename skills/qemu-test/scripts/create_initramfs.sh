@@ -166,6 +166,14 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || {
     mknod /dev/tty c 5 0
 }
 
+# Create loop device nodes (devtmpfs doesn't create them dynamically,
+# and busybox may lack mknod. Static nodes from initramfs archive are
+# hidden when devtmpfs mounts on top, so create them here.)
+mknod /dev/loop-control c 10 237 2>/dev/null || true
+for i in 0 1 2 3 4 5 6 7; do
+    mknod /dev/loop${i} b 7 ${i} 2>/dev/null || true
+done
+
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export HOME=/root
 
@@ -247,6 +255,10 @@ fi
 mknod "$OUTPUT_DIR/dev/console" c 5 1 2>/dev/null || true
 mknod "$OUTPUT_DIR/dev/null" c 1 3 2>/dev/null || true
 mknod "$OUTPUT_DIR/dev/tty" c 5 0 2>/dev/null || true
+for i in 0 1 2 3 4 5 6 7; do
+    mknod "$OUTPUT_DIR/dev/loop${i}" b 7 ${i} 2>/dev/null || true
+done
+mknod "$OUTPUT_DIR/dev/loop-control" c 10 237 2>/dev/null || true
 
 # Create cpio archive
 echo "Creating initramfs archive..."
