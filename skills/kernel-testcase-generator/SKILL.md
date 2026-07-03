@@ -627,3 +627,86 @@ If self-verification fails:
 - Give up if first attempt fails
 - Expect perfect reproduction in self-verification
 - Run extensive debugging (test expert's job)
+## Collaboration with kernel-test-validator
+
+This skill works in tandem with `/kernel-test-validator` to form a complete reproduction workflow.
+
+### Role Separation
+
+**This skill (testcase-generator)**: Kernel expert - **constructs** reproduction cases
+- Analyzes problem from vmcore/lock analysis
+- Generates test code (kernel modules, user programs)
+- Performs **minimal** self-verification (compilation + basic check)
+- **Does NOT run full QEMU testing**
+
+**kernel-test-validator**: Testing expert - **validates** reproduction cases
+- Receives cases from this skill or other experts
+- Compiles kernel with proper configs (`/kernel-build`)
+- Tests in QEMU (`/qemu-test`)
+- Generates structured validation reports
+- Provides feedback for iteration if failed
+
+### Workflow Integration
+
+```
+Analysis Phase: /vmcore-analyzer → /lock-analyzer → /rag-case-retrieval
+    ↓
+Construction Phase (THIS SKILL): Generate reproducer + case.yaml
+    ↓
+Validation Phase (/kernel-test-validator): Compile kernel → Test QEMU → Report
+    ↓
+If FAILED → Iteration Loop: Feedback → Refine → Re-validate
+```
+
+### Interface Contract
+
+**Output for validator**: Standard YAML format (`case.yaml`)
+```yaml
+case_id: "BUG-001"
+test_case_type: kernel_module
+configs: [CONFIG_X=y]
+expected_result: "Should trigger X"
+timeout: 150
+generator_verification: passed
+```
+
+**Validator feedback**: Structured recommendations
+```markdown
+Recommendations:
+1. Config Issues: Missing CONFIG_X
+2. Test Method: Timeout too short
+3. Expected Pattern: Update pattern
+```
+
+### Handoff Protocol
+
+After self-verification passes:
+```bash
+# Output case.yaml for validator
+/kernel-test-validator generated_case/case.yaml
+```
+
+**Don't**:
+- Run QEMU testing (validator's job)
+- Test multiple architectures (validator's job)
+- Stress testing (validator's job)
+
+**Do**:
+- Compile reproducer module (self-check only)
+- Basic load/unload test
+- Generate case.yaml
+- Document rationale
+
+### Integration Example
+
+See `examples/kernel-deadlock-scenario/` in Analysis-SKILL project:
+- `generated_case/` - Output from this skill
+- `validation_outputs/` - Output from validator
+
+For complete integration guide, see project docs:
+- `docs/kernel-skills-integration.md`
+- `docs/kernel-test-validator-guide.md`
+
+---
+
+**Key Principle**: Construct → Handoff → Validate → Iterate

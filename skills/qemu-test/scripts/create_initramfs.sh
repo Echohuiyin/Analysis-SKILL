@@ -147,7 +147,7 @@ cd "$OUTPUT_DIR/bin"
 for cmd in sh ash cat ls mkdir mount umount echo sleep poweroff reboot dmesg grep \
            uname lsmod insmod rmmod modprobe ifconfig ip route ping wget curl \
            vi less more head tail wc awk sed tr cut sort uniq diff find xargs \
-           test "[" "bracket" true false; do
+           test "[" "bracket" true false expr seq chmod; do
     ln -sf busybox "$cmd" 2>/dev/null || true
 done
 cd -
