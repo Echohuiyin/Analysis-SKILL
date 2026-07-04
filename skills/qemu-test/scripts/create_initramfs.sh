@@ -56,6 +56,15 @@ find_busybox() {
         if [ -x "$busybox" ]; then
             local detected_arch=$(detect_busybox_arch "$busybox")
             if [ "$detected_arch" = "$target_arch" ]; then
+                # Applet health check: a corrupted/stub busybox build
+                # (e.g. /tmp/busybox_build_x86_64 left over from a failed
+                # build) passes the arch check but reports "applet not
+                # found" for every command, breaking initramfs shells.
+                # `--list` returns ≥1 applet on a healthy busybox.
+                if ! "$busybox" --list >/dev/null 2>&1; then
+                    echo "⚠️  Busybox at $busybox fails applet health check (likely a stub), skipping" >&2
+                    continue
+                fi
                 echo "$busybox"
                 return 0
             else
@@ -171,7 +180,7 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || {
 # scratch files under /run /var/tmp /root — if these don't exist the
 # redirect fails silently, repro_c never starts, and init exits with
 # "Attempted to kill init" panic that masquerades as a test failure.
-mkdir -p /tmp /run /var/tmp /root
+mkdir -p /tmp /run /var/tmp /var/log /root
 chmod 1777 /tmp
 
 # Create loop device nodes (devtmpfs doesn't create them dynamically,
