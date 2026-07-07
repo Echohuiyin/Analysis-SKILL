@@ -55,12 +55,16 @@ class CrashSessionManager:
         vmcore_path: Path,
         vmlinux_path: Path,
         config: Optional[AppConfig] = None,
-        prompt: str = "crash>",
+        prompt: str = r"crash[_a-zA-Z0-9]*>",
         cmd_log_path: Optional[Path] = None,
     ) -> None:
         self.config = config or AppConfig()
         self.vmcore_path = vmcore_path
         self.vmlinux_path = vmlinux_path
+        # Default prompt regex matches crash> AND crash_arm64> / crash_x86_64>
+        # (crash utility uses argv[0] as the prompt prefix when binary is
+        # renamed — required for cross-arch analysis where we ship multiple
+        # crash binaries named by target arch).
         self.prompt = prompt
         self._child: Optional[pexpect.spawn] = None
         self._lock = threading.RLock()
