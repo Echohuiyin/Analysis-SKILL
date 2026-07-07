@@ -5,7 +5,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+# SCRIPT_DIR = .../Analysis-SKILL/skills/qemu-test/scripts
+# Walk up 3 levels to reach .../Analysis-SKILL (where tools/busybox/prebuilt/ lives).
+PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 BUSYBOX_VERSION="1.36.1"
 ARCH="${ARCH:-arm64}"  # Default to arm64, can be overridden
 
@@ -61,9 +63,34 @@ find_busybox() {
                 # build) passes the arch check but reports "applet not
                 # found" for every command, breaking initramfs shells.
                 # `--list` returns ≥1 applet on a healthy busybox.
-                if ! "$busybox" --list >/dev/null 2>&1; then
-                    echo "⚠️  Busybox at $busybox fails applet health check (likely a stub), skipping" >&2
-                    continue
+                #
+                # Skip the runtime check when target_arch != host_arch —
+                # we can't execute the cross-arch binary on this host, so
+                # fall back to file-size sanity (a stub is <10KB, a real
+                # busybox is 1MB+).
+                local host_arch=$(uname -m)
+                local need_runtime_check=1
+                if [ "$target_arch" = "arm64" ] && [ "$host_arch" != "aarch64" ]; then
+                    need_runtime_check=0
+                elif [ "$target_arch" = "arm32" ] && [ "$host_arch" != "armv7l" ] && [ "$host_arch" != "armv6l" ]; then
+                    need_runtime_check=0
+                elif [ "$target_arch" = "x86_64" ] && [ "$host_arch" != "x86_64" ] && [ "$host_arch" != "amd64" ]; then
+                    need_runtime_check=0
+                fi
+
+                if [ "$need_runtime_check" = "1" ]; then
+                    if ! "$busybox" --list >/dev/null 2>&1; then
+                        echo "⚠️  Busybox at $busybox fails applet health check (likely a stub), skipping" >&2
+                        continue
+                    fi
+                else
+                    # Cross-arch: can't run --list. Use file size as a stub guard.
+                    local bb_size=$(stat -c%s "$busybox" 2>/dev/null || stat -f%z "$busybox" 2>/dev/null || echo 0)
+                    if [ "$bb_size" -lt 100000 ]; then
+                        echo "⚠️  Busybox at $busybox is too small ($bb_size bytes, likely a stub), skipping" >&2
+                        continue
+                    fi
+                    echo "ℹ️  Cross-arch busybox at $busybox ($bb_size bytes) — skipping runtime applet check (cannot execute $target_arch binary on $host_arch host)" >&2
                 fi
                 echo "$busybox"
                 return 0

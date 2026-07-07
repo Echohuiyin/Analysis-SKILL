@@ -185,6 +185,14 @@ done
 # Enable tail features (fixes "tail: invalid option" issue)
 sed -i 's/# CONFIG_FEATURE_TAIL_USE_F is not set/CONFIG_FEATURE_TAIL_USE_F=y/' .config
 
+# Enable shell math support (fixes "$((arith)) is disabled" in init scripts
+sed -i 's/# CONFIG_FEATURE_SH_MATH is not set/CONFIG_FEATURE_SH_MATH=y/' .config
+sed -i 's/# CONFIG_FEATURE_SH_MATH_64 is not set/CONFIG_FEATURE_SH_MATH_64=y/' .config
+
+# Enable standalone shell mode (faster applet dispatch, no PATH lookups)
+sed -i 's/# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/' .config
+sed -i 's/# CONFIG_FEATURE_SH_NOFORK is not set/CONFIG_FEATURE_SH_NOFORK=y/' .config
+
 # Step 4: Add custom applets if specified
 if [ -n "$CUSTOM_APPLETS" ]; then
     echo "[Config] Adding custom applets: $CUSTOM_APPLETS"

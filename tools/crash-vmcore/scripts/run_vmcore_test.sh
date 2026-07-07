@@ -56,12 +56,13 @@ echo
 
 # Check kernel architecture
 # bzImage format: "Linux kernel x86 boot executable bzImage"
-# ELF format: "ELF 64-bit LSB executable, x86-64"
+# arm64 Image format: "Linux kernel ARM64 boot executable Image, little-endian, 4K pages"
+# ELF format: "ELF 64-bit LSB executable, x86-64" / "ARM aarch64"
 KERNEL_INFO=$(file "$KERNEL_IMAGE")
 
 if echo "$KERNEL_INFO" | grep -qE "x86 boot executable|x86-64"; then
     KERNEL_ARCH="x86-64"
-elif echo "$KERNEL_INFO" | grep -qE "ARM aarch64|ARM,"; then
+elif echo "$KERNEL_INFO" | grep -qE "ARM64 boot executable|ARM aarch64|ARM,"; then
     KERNEL_ARCH="ARM aarch64"
 else
     echo "ERROR: Unknown kernel architecture: $KERNEL_INFO"
@@ -71,10 +72,12 @@ fi
 if [ "$KERNEL_ARCH" = "x86-64" ]; then
     QEMU_CMD="qemu-system-x86_64"
     MACHINE="q35,dump-guest-core=on"
+    CPU="host"
     CONSOLE="ttyS0"
 elif [ "$KERNEL_ARCH" = "ARM aarch64" ]; then
     QEMU_CMD="qemu-system-aarch64"
     MACHINE="virt,dump-guest-core=on"
+    CPU="cortex-a57"
     CONSOLE="ttyAMA0"
 else
     echo "ERROR: Unknown kernel architecture: $KERNEL_ARCH"
@@ -111,6 +114,7 @@ echo "[QEMU] Starting with vmcoreinfo device..."
 
 $QEMU_CMD \
     -M "$MACHINE" \
+    -cpu "$CPU" \
     -device vmcoreinfo \
     -smp 2 \
     -m 512M \
