@@ -1,0 +1,10 @@
+/crash
+/crash_x86_64
+/crash_arm64
+/gdb-*/
+/gdb-*.tar.gz
+/gdb.files
+*.o
+*.a
+*.so
+*.cmd

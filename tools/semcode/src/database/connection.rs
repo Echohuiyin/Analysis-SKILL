@@ -1,0 +1,5936 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+use crate::CallRelationship;
+use anyhow::Result;
+use arrow::array::{Array, StringArray};
+use arrow::record_batch::RecordBatch;
+use colored::*;
+use futures::TryStreamExt;
+use lancedb::connection::Connection;
+use lancedb::index::scalar::FullTextSearchQuery;
+use lancedb::query::ExecutableQuery;
+use lancedb::query::QueryBase;
+
+use crate::database::branches::IndexedBranchStore;
+use crate::database::functions::FunctionStore;
+use crate::database::schema::SchemaManager;
+use crate::database::search::{SearchManager, VectorSearchManager};
+use crate::database::symbol_filename::SymbolFilenameStore;
+use crate::database::types::{TypeStore, TypedefStore};
+// CallStore removed - call relationships are now embedded in function JSON columns
+use crate::database::content::{ContentInfo, ContentStore};
+use crate::database::processed_files::{ProcessedFileRecord, ProcessedFileStore};
+use crate::database::vectors::VectorStore;
+use crate::types::{FunctionInfo, TypeInfo, TypedefInfo};
+use crate::vectorizer::CodeVectorizer;
+use crate::workdir::WorkdirIndex;
+use std::collections::HashSet;
+
+// Optimal batch size for LanceDB operations
+pub const OPTIMAL_BATCH_SIZE: usize = 65536;
+
+pub struct DatabaseManager {
+    connection: Connection,
+    git_repo_path: String,
+    function_store: FunctionStore,
+    type_store: TypeStore,
+    typedef_store: TypedefStore,
+    search_manager: SearchManager,
+    vector_search_manager: VectorSearchManager,
+    schema_manager: SchemaManager,
+    processed_file_store: ProcessedFileStore,
+    content_store: ContentStore,
+    symbol_filename_store: SymbolFilenameStore,
+    branch_store: IndexedBranchStore,
+    workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
+}
+
+impl DatabaseManager {
+    pub async fn new(db_path: &str, git_repo_path: String) -> Result<Self> {
+        let connection = lancedb::connect(db_path).execute().await?;
+
+        Ok(Self {
+            connection: connection.clone(),
+            git_repo_path: git_repo_path.clone(),
+            function_store: FunctionStore::new(connection.clone()),
+            type_store: TypeStore::new(connection.clone()),
+            typedef_store: TypedefStore::new(connection.clone()),
+            search_manager: SearchManager::new(connection.clone(), git_repo_path),
+            vector_search_manager: VectorSearchManager::new(connection.clone()),
+            schema_manager: SchemaManager::new(connection.clone()),
+            processed_file_store: ProcessedFileStore::new(connection.clone()),
+            content_store: ContentStore::new(connection.clone()),
+            symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
+            branch_store: IndexedBranchStore::new(connection.clone()),
+            workdir_index: std::sync::RwLock::new(None),
+        })
+    }
+
+    pub async fn list_tables(&self) -> Result<Vec<String>> {
+        Ok(self.connection.table_names().execute().await?)
+    }
+
+    pub async fn create_tables(&self) -> Result<()> {
+        self.schema_manager.create_all_tables().await?;
+        self.schema_manager.create_scalar_indices().await?;
+        Ok(())
+    }
+
+    /// Set the working directory index for overlaying uncommitted changes on queries.
+    /// When set, all `_git_aware` methods will automatically merge results from the
+    /// working directory overlay with database results.
+    pub fn set_workdir_index(&self, workdir: WorkdirIndex) {
+        *self.workdir_index.write().unwrap() = Some(workdir);
+    }
+
+    /// Check if a workdir index is set.
+    pub fn has_workdir_index(&self) -> bool {
+        self.workdir_index.read().unwrap().is_some()
+    }
+
+    /// Clear the working directory index.
+    pub fn clear_workdir_index(&self) {
+        *self.workdir_index.write().unwrap() = None;
+    }
+
+    /// Take the working directory index out, leaving None in its place.
+    /// Used to extract the previous index for incremental rebuilds.
+    pub fn take_workdir_index(&self) -> Option<WorkdirIndex> {
+        self.workdir_index.write().unwrap().take()
+    }
+
+    pub async fn clear_all_data(&self) -> Result<()> {
+        // Delete all data from each main table
+        for table_name in &[
+            "functions",
+            "types",
+            "vectors",
+            "commit_vectors",
+            "lore_vectors",
+            "processed_files",
+            "symbol_filename",
+            "git_commits",
+            "lore",
+            "lore_indexed_commits",
+            "indexed_branches",
+        ] {
+            if let Ok(table) = self.connection.open_table(*table_name).execute().await {
+                table.delete("1=1").await?;
+            }
+        }
+
+        // Delete all data from content shard tables (content_0 through content_15)
+        for shard in 0..16u8 {
+            let table_name = format!("content_{shard}");
+            if let Ok(table) = self.connection.open_table(&table_name).execute().await {
+                table.delete("1=1").await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Scan all tables for 100% duplicate entries and report statistics
+    pub async fn scan_for_duplicates(&self) -> Result<()> {
+        println!("{}", "=== Database Duplicate Scan ===".bold().green());
+        println!("Scanning for entries where ALL columns are identical...\n");
+
+        let tables_to_scan = [
+            "functions",
+            "types",
+            "processed_files",
+            "symbol_filename",
+            "git_commits",
+            "vectors", // Function vectors table
+            "commit_vectors",
+            "lore",
+            "lore_vectors",
+        ];
+
+        // Scan main tables
+        for table_name in &tables_to_scan {
+            if let Ok(table) = self.connection.open_table(*table_name).execute().await {
+                match self.scan_table_for_duplicates(table_name, &table).await {
+                    Ok((total_rows, duplicate_groups, duplicate_count, examples)) => {
+                        println!("{}", format!("=== {table_name} ===").bold().cyan());
+                        println!("Total rows: {}", total_rows.to_string().yellow());
+
+                        if duplicate_groups > 0 {
+                            println!("Duplicate groups: {}", duplicate_groups.to_string().red());
+                            println!(
+                                "Total duplicate rows: {}",
+                                duplicate_count.to_string().red()
+                            );
+
+                            // Debug the calculation
+                            let percentage = duplicate_count as f64 / total_rows as f64 * 100.0;
+                            println!("Duplicate percentage: {percentage:.2}%");
+
+                            if !examples.is_empty() {
+                                println!("\nExample duplicates (showing up to 5 groups):");
+                                for (i, example) in examples.iter().enumerate().take(5) {
+                                    println!(
+                                        "  Group {}: {} identical rows",
+                                        i + 1,
+                                        example.len().to_string().yellow()
+                                    );
+                                    if let Some(first_row) = example.first() {
+                                        println!("    Sample: {}", first_row.cyan());
+                                    }
+                                }
+                            }
+                        } else {
+                            println!("{}", "No duplicates found ✓".green());
+                        }
+                        println!();
+                    }
+                    Err(e) => {
+                        println!(
+                            "{} Failed to scan table {}: {}",
+                            "Error:".red(),
+                            table_name,
+                            e
+                        );
+                    }
+                }
+            } else {
+                println!("{} Table {} not found", "Warning:".yellow(), table_name);
+            }
+        }
+
+        // Scan content shard tables (content_0 through content_15)
+        for shard in 0..16u8 {
+            let table_name = format!("content_{shard}");
+            if let Ok(table) = self.connection.open_table(&table_name).execute().await {
+                match self.scan_table_for_duplicates(&table_name, &table).await {
+                    Ok((total_rows, duplicate_groups, duplicate_count, examples)) => {
+                        println!("{}", format!("=== {table_name} ===").bold().cyan());
+                        println!("Total rows: {}", total_rows.to_string().yellow());
+
+                        if duplicate_groups > 0 {
+                            println!("Duplicate groups: {}", duplicate_groups.to_string().red());
+                            println!(
+                                "Total duplicate rows: {}",
+                                duplicate_count.to_string().red()
+                            );
+
+                            let percentage = duplicate_count as f64 / total_rows as f64 * 100.0;
+                            println!("Duplicate percentage: {percentage:.2}%");
+
+                            if !examples.is_empty() {
+                                println!("\nExample duplicates (showing up to 5 groups):");
+                                for (i, example) in examples.iter().enumerate().take(5) {
+                                    println!(
+                                        "  Group {}: {} identical rows",
+                                        i + 1,
+                                        example.len().to_string().yellow()
+                                    );
+                                    if let Some(first_row) = example.first() {
+                                        println!("    Sample: {}", first_row.cyan());
+                                    }
+                                }
+                            }
+                        } else {
+                            println!("{}", "No duplicates found ✓".green());
+                        }
+                        println!();
+                    }
+                    Err(e) => {
+                        println!(
+                            "{} Failed to scan table {}: {}",
+                            "Error:".red(),
+                            table_name,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Scan a specific table for duplicates
+    async fn scan_table_for_duplicates(
+        &self,
+        table_name: &str,
+        table: &lancedb::Table,
+    ) -> Result<(usize, usize, usize, Vec<Vec<String>>)> {
+        use futures::TryStreamExt;
+        use std::collections::HashMap;
+
+        let results = table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut row_counts: HashMap<String, usize> = HashMap::new();
+        let mut row_examples: HashMap<String, String> = HashMap::new();
+        let mut total_rows = 0;
+
+        for batch in results {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            for row_idx in 0..batch.num_rows() {
+                total_rows += 1;
+
+                // Create a string representation of all columns for this row
+                let row_signature = self.create_row_signature(&batch, row_idx, table_name)?;
+
+                // Count occurrences and store example
+                *row_counts.entry(row_signature.clone()).or_insert(0) += 1;
+                row_examples
+                    .entry(row_signature.clone())
+                    .or_insert_with(|| {
+                        self.create_readable_row_summary(&batch, row_idx, table_name)
+                            .unwrap_or_default()
+                    });
+            }
+        }
+
+        // Find duplicates (count > 1)
+        let mut duplicate_groups = 0;
+        let mut total_duplicate_rows = 0;
+        let mut examples = Vec::new();
+
+        for (signature, count) in &row_counts {
+            if *count > 1 {
+                duplicate_groups += 1;
+                total_duplicate_rows += count;
+
+                // Create example entries for this duplicate group
+                if examples.len() < 5 {
+                    let example_description = row_examples.get(signature).unwrap_or(signature);
+                    examples.push(vec![example_description.clone(); *count]);
+                }
+            }
+        }
+
+        Ok((total_rows, duplicate_groups, total_duplicate_rows, examples))
+    }
+
+    /// Create a unique signature for a row by concatenating all column values
+    fn create_row_signature(
+        &self,
+        batch: &arrow::record_batch::RecordBatch,
+        row_idx: usize,
+        _table_name: &str,
+    ) -> Result<String> {
+        use arrow::array::Array;
+
+        let mut signature_parts = Vec::new();
+
+        for col_idx in 0..batch.num_columns() {
+            let column = batch.column(col_idx);
+            let value_str = match column.data_type() {
+                arrow::datatypes::DataType::Utf8 => {
+                    let string_array = column
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .unwrap();
+                    if string_array.is_null(row_idx) {
+                        "NULL".to_string()
+                    } else {
+                        string_array.value(row_idx).to_string()
+                    }
+                }
+                // FixedSizeBinary(32) case removed - all hashes now stored as Utf8 hex strings
+                arrow::datatypes::DataType::UInt32 => {
+                    let uint32_array = column
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt32Array>()
+                        .unwrap();
+                    if uint32_array.is_null(row_idx) {
+                        "NULL".to_string()
+                    } else {
+                        uint32_array.value(row_idx).to_string()
+                    }
+                }
+                arrow::datatypes::DataType::UInt64 => {
+                    let uint64_array = column
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt64Array>()
+                        .unwrap();
+                    if uint64_array.is_null(row_idx) {
+                        "NULL".to_string()
+                    } else {
+                        uint64_array.value(row_idx).to_string()
+                    }
+                }
+                arrow::datatypes::DataType::Boolean => {
+                    let bool_array = column
+                        .as_any()
+                        .downcast_ref::<arrow::array::BooleanArray>()
+                        .unwrap();
+                    if bool_array.is_null(row_idx) {
+                        "NULL".to_string()
+                    } else {
+                        bool_array.value(row_idx).to_string()
+                    }
+                }
+                arrow::datatypes::DataType::Float32 => {
+                    let float32_array = column
+                        .as_any()
+                        .downcast_ref::<arrow::array::Float32Array>()
+                        .unwrap();
+                    if float32_array.is_null(row_idx) {
+                        "NULL".to_string()
+                    } else {
+                        float32_array.value(row_idx).to_string()
+                    }
+                }
+                _ => format!("UNSUPPORTED_TYPE_{}", column.data_type()),
+            };
+            signature_parts.push(value_str);
+        }
+
+        Ok(signature_parts.join("||"))
+    }
+
+    /// Create a human-readable summary of a row for examples
+    fn create_readable_row_summary(
+        &self,
+        batch: &arrow::record_batch::RecordBatch,
+        row_idx: usize,
+        table_name: &str,
+    ) -> Result<String> {
+        use arrow::array::Array;
+
+        match table_name {
+            "functions" => {
+                let name_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let file_path_array = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let git_hash_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                let name = if name_array.is_null(row_idx) {
+                    "NULL"
+                } else {
+                    name_array.value(row_idx)
+                };
+                let file_path = if file_path_array.is_null(row_idx) {
+                    "NULL"
+                } else {
+                    file_path_array.value(row_idx)
+                };
+                let git_hash = if git_hash_array.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    let hash_str = git_hash_array.value(row_idx);
+                    if hash_str.len() >= 8 {
+                        hash_str[..8].to_string()
+                    } else {
+                        hash_str.to_string()
+                    }
+                };
+
+                Ok(format!("{name}() in {file_path} ({git_hash}...)"))
+            }
+            "types" => {
+                let name_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let file_path_array = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let kind_array = batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                let name = if name_array.is_null(row_idx) {
+                    "NULL"
+                } else {
+                    name_array.value(row_idx)
+                };
+                let file_path = if file_path_array.is_null(row_idx) {
+                    "NULL"
+                } else {
+                    file_path_array.value(row_idx)
+                };
+                let kind = if kind_array.is_null(row_idx) {
+                    "NULL"
+                } else {
+                    kind_array.value(row_idx)
+                };
+
+                Ok(format!("{kind} {name} in {file_path}"))
+            }
+            _ => {
+                // Generic format for other tables
+                let first_col = batch.column(0);
+                let first_value = match first_col.data_type() {
+                    arrow::datatypes::DataType::Utf8 => {
+                        let string_array = first_col
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                            .unwrap();
+                        if string_array.is_null(row_idx) {
+                            "NULL".to_string()
+                        } else {
+                            string_array.value(row_idx).to_string()
+                        }
+                    }
+                    _ => "...".to_string(),
+                };
+                Ok(format!("{table_name} row: {first_value}"))
+            }
+        }
+    }
+
+    pub async fn optimize_tables(&self) -> Result<()> {
+        self.schema_manager.optimize_tables().await
+    }
+
+    pub async fn compact_and_cleanup(&self) -> Result<()> {
+        self.schema_manager.compact_and_cleanup().await
+    }
+
+    pub async fn compact_lore_tables(&self) -> Result<()> {
+        self.schema_manager.compact_lore_tables().await
+    }
+
+    /// Drop and recreate all tables for maximum space savings
+    pub async fn drop_and_recreate_tables(&self) -> Result<()> {
+        self.schema_manager.drop_and_recreate_tables().await
+    }
+
+    /// Drop and rebuild all FTS indices for the lore table from scratch.
+    pub async fn create_lore_fts_indices(&self) -> Result<()> {
+        self.schema_manager.create_lore_fts_indices().await
+    }
+
+    /// Create FTS indices only if they do not already exist.
+    pub async fn ensure_lore_fts_indices(&self) -> Result<()> {
+        self.schema_manager.ensure_lore_fts_indices().await
+    }
+
+    /// Merge newly-inserted rows into existing lore FTS indices.
+    pub async fn optimize_lore_fts_indices(&self) -> Result<()> {
+        self.schema_manager.optimize_lore_fts_indices().await
+    }
+
+    /// Get lore table information including row count and indices
+    pub async fn get_lore_table_info(&self) -> Result<String> {
+        use std::fmt::Write;
+        let mut output = String::new();
+
+        let table = self.connection.open_table("lore").execute().await?;
+
+        // Get row count
+        let count = table.count_rows(None).await?;
+        writeln!(&mut output, "Lore Table Information:")?;
+        writeln!(&mut output, "  Total emails: {}", count)?;
+
+        // List indices
+        let indices = table.list_indices().await?;
+        writeln!(&mut output, "\nIndices ({} total):", indices.len())?;
+
+        for idx in &indices {
+            writeln!(
+                &mut output,
+                "  - {} on {:?} (type: {:?})",
+                idx.name, idx.columns, idx.index_type
+            )?;
+        }
+
+        Ok(output)
+    }
+
+    /// Drop and recreate a specific table
+    pub async fn drop_and_recreate_table(&self, table_name: &str) -> Result<()> {
+        self.schema_manager
+            .drop_and_recreate_table(table_name)
+            .await
+    }
+
+    pub async fn rebuild_indices(&self) -> Result<()> {
+        self.schema_manager.rebuild_indices().await
+    }
+
+    pub async fn create_vector_index(&self) -> Result<()> {
+        self.vector_search_manager.create_vector_index().await
+    }
+
+    // Combined batch operations for optimal performance
+    pub async fn insert_batch_combined(
+        &self,
+        mut functions: Vec<FunctionInfo>,
+        types: Vec<TypeInfo>,
+        macros: Vec<FunctionInfo>,
+    ) -> Result<()> {
+        // Macros are now stored as functions - combine them
+        functions.extend(macros);
+        // Step 1: Extract all content and combine into a single batch
+        let mut all_content_items = Vec::new();
+
+        // Extract function bodies
+        for func in &functions {
+            if !func.body.is_empty() {
+                all_content_items.push(crate::database::content::ContentInfo {
+                    blake3_hash: crate::hash::compute_blake3_hash(&func.body),
+                    content: func.body.clone(),
+                });
+            }
+        }
+
+        // Extract type definitions
+        for type_info in &types {
+            if !type_info.definition.is_empty() {
+                all_content_items.push(crate::database::content::ContentInfo {
+                    blake3_hash: crate::hash::compute_blake3_hash(&type_info.definition),
+                    content: type_info.definition.clone(),
+                });
+            }
+        }
+
+        // Note: Macros are now stored as functions, so no separate loop needed
+
+        // Step 2: Extract symbol_filename pairs for all entities
+        let mut symbol_filename_pairs = Vec::new();
+
+        // Extract from functions
+        for func in &functions {
+            symbol_filename_pairs.push((func.name.clone(), func.file_path.clone()));
+        }
+
+        // Extract from types
+        for type_info in &types {
+            symbol_filename_pairs.push((type_info.name.clone(), type_info.file_path.clone()));
+        }
+
+        // Note: Macros are now in functions, so no separate loop needed
+
+        // Step 3: Insert content and metadata in parallel
+        let (content_result, func_result, type_result, symbol_filename_result) = tokio::join!(
+            async {
+                if !all_content_items.is_empty() {
+                    self.content_store.insert_batch(all_content_items).await
+                } else {
+                    Ok(())
+                }
+            },
+            async {
+                if !functions.is_empty() {
+                    self.insert_functions_metadata_only(functions).await
+                } else {
+                    Ok(())
+                }
+            },
+            async {
+                if !types.is_empty() {
+                    self.insert_types_metadata_only(types).await
+                } else {
+                    Ok(())
+                }
+            },
+            async {
+                if !symbol_filename_pairs.is_empty() {
+                    self.symbol_filename_store
+                        .insert_batch(symbol_filename_pairs)
+                        .await
+                } else {
+                    Ok(())
+                }
+            }
+        );
+
+        content_result?;
+        func_result?;
+        type_result?;
+        symbol_filename_result?;
+
+        Ok(())
+    }
+
+    // Function operations
+    pub async fn insert_functions(&self, functions: Vec<FunctionInfo>) -> Result<()> {
+        // Extract (symbol_name, filename) pairs for symbol_filename table
+        let symbol_filename_pairs: Vec<(String, String)> = functions
+            .iter()
+            .map(|f| (f.name.clone(), f.file_path.clone()))
+            .collect();
+
+        // Insert functions
+        self.function_store.insert_batch(functions).await?;
+
+        // Insert into symbol_filename table
+        self.symbol_filename_store
+            .insert_batch(symbol_filename_pairs)
+            .await?;
+
+        Ok(())
+    }
+
+    // --- Workdir overlay helpers ---
+
+    /// Look up a function in the workdir overlay (if set).
+    fn workdir_find_function(&self, name: &str) -> Option<FunctionInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().and_then(|w| w.find_function(name).cloned())
+    }
+
+    /// Look up all functions matching a name in the workdir overlay.
+    fn workdir_find_all_functions(&self, name: &str) -> Vec<FunctionInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.find_all_functions(name).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Look up a type in the workdir overlay (if set).
+    fn workdir_find_type(&self, name: &str) -> Option<TypeInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().and_then(|w| w.find_type(name).cloned())
+    }
+
+    /// Find callers in the workdir overlay.
+    fn workdir_find_callers(&self, name: &str) -> Vec<FunctionInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.find_callers(name).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Find callees in the workdir overlay.
+    fn workdir_find_callees(&self, name: &str) -> Option<Vec<String>> {
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().and_then(|w| w.find_callees(name))
+    }
+
+    /// Grep function bodies in the workdir overlay.
+    fn workdir_grep_functions(
+        &self,
+        pattern: &str,
+        path_pattern: Option<&str>,
+    ) -> Vec<FunctionInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| {
+                w.grep_functions(pattern, path_pattern)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Regex search for functions in the workdir overlay.
+    fn workdir_find_functions_regex(&self, pattern: &str) -> Vec<FunctionInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| {
+                w.find_functions_regex(pattern)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Regex search for types in the workdir overlay.
+    fn workdir_find_types_regex(&self, pattern: &str) -> Vec<TypeInfo> {
+        let guard = self.workdir_index.read().unwrap();
+        guard
+            .as_ref()
+            .map(|w| w.find_types_regex(pattern).into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Check if a file is deleted in the workdir overlay.
+    fn workdir_is_deleted(&self, file_path: &str) -> bool {
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().is_some_and(|w| w.is_deleted(file_path))
+    }
+
+    /// Merge a HEAD manifest with workdir dirty/deleted state.
+    fn workdir_merged_manifest(
+        &self,
+        head_manifest: std::collections::HashMap<String, String>,
+    ) -> std::collections::HashMap<String, String> {
+        let guard = self.workdir_index.read().unwrap();
+        match guard.as_ref() {
+            Some(w) => w.merged_manifest(&head_manifest),
+            None => head_manifest,
+        }
+    }
+
+    /// Find a function by name without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `find_function_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns the "best match" from all indexed versions without considering git history.
+    /// Prefers .c over .h files, implementations over declarations, but may not match
+    /// the version currently in your working directory.
+    pub async fn find_function(&self, name: &str) -> Result<Option<FunctionInfo>> {
+        // Get all functions with this name and select the best one (prefers .c over .h, implementations over declarations)
+        let all_matches = self
+            .function_store
+            .find_all_by_name_unfiltered(name)
+            .await?;
+        if all_matches.is_empty() {
+            return Ok(None);
+        }
+
+        // Use the same smart selection logic as git-aware lookups
+        let best_match = self.select_best_function_match(all_matches);
+        Ok(Some(best_match))
+    }
+
+    pub async fn find_function_git_aware(
+        &self,
+        name: &str,
+        git_sha: &str,
+    ) -> Result<Option<FunctionInfo>> {
+        // Check workdir overlay first — if the function is in a dirty file, return it
+        if let Some(func) = self.workdir_find_function(name) {
+            return Ok(Some(func));
+        }
+        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        if git_manifest.is_empty() {
+            tracing::info!(
+                "No files resolved for '{}' at commit '{}' - falling back to non-git lookup",
+                name,
+                git_sha
+            );
+            return self.find_function(name).await;
+        }
+        self.find_function_with_manifest(name, &git_manifest).await
+    }
+
+    /// Find a function by name using a pre-generated git manifest (fast - no manifest regeneration)
+    pub async fn find_function_with_manifest(
+        &self,
+        name: &str,
+        git_manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<Option<FunctionInfo>> {
+        // Step 1: Get candidate file paths from symbol_filename table
+        let unique_file_paths = self
+            .symbol_filename_store
+            .get_filenames_for_symbol(name)
+            .await?;
+        if unique_file_paths.is_empty() {
+            return Ok(None);
+        }
+
+        // Step 2: Use manifest to get hashes for candidate files (fast HashMap lookups)
+        let mut resolved_hashes = Vec::new();
+        for file_path in &unique_file_paths {
+            if let Some(hash) = git_manifest.get(file_path) {
+                resolved_hashes.push((file_path.clone(), hash.clone()));
+            }
+        }
+
+        if resolved_hashes.is_empty() {
+            // Fallback: do a regular find to get any available functions
+            return self.find_function(name).await;
+        }
+
+        // Step 3: Direct targeted search for each (filename, git_hash) combination
+        let mut matches = Vec::new();
+        for (file_path, git_hash) in &resolved_hashes {
+            if let Some(func) = self
+                .function_store
+                .find_by_name_file_and_hash(name, file_path, git_hash)
+                .await?
+            {
+                matches.push(func);
+            }
+        }
+
+        // Step 4: Pick the best result (prefer implementation over declaration)
+        if matches.is_empty() {
+            // Fallback: do a regular find to get any available function
+            return self.find_function(name).await;
+        }
+
+        let best_match = self.select_best_function_match(matches);
+        Ok(Some(best_match))
+    }
+
+    /// Get just the types field for a function using pre-generated manifest (very fast - no body fetching)
+    pub async fn get_function_types_with_manifest(
+        &self,
+        name: &str,
+        git_manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>> {
+        // Query functions table directly - only read the columns we need
+        let escaped_name = name.replace("'", "''");
+        let table = self.connection.open_table("functions").execute().await?;
+
+        let results = table
+            .query()
+            .only_if(format!("name = '{escaped_name}'"))
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Find best matching function and extract types
+        let mut matches = Vec::new();
+
+        for batch in results {
+            if batch.num_rows() > 0 {
+                let file_path_array = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let git_file_hash_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let line_start_array = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+                let line_end_array = batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+
+                // Find the types column
+                let types_column_idx = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "types")
+                    .ok_or_else(|| anyhow::anyhow!("types column not found in functions table"))?;
+                let types_array = batch
+                    .column(types_column_idx)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let file_path = file_path_array.value(i);
+                    let git_file_hash = git_file_hash_array.value(i);
+
+                    // Check if this function exists at the target git SHA
+                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                        if git_file_hash == expected_hash {
+                            // Parse the types JSON
+                            let types = if types_array.is_null(i) {
+                                None
+                            } else {
+                                serde_json::from_str::<Vec<String>>(types_array.value(i)).ok()
+                            };
+
+                            matches.push((
+                                file_path.to_string(),
+                                line_start_array.value(i) as u32,
+                                line_end_array.value(i) as u32,
+                                types,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Select best match (prefer implementation over declaration)
+        let best_match = matches
+            .into_iter()
+            .max_by_key(|(file_path, line_start, line_end, _)| {
+                let line_count = line_end.saturating_sub(*line_start);
+                let is_header = file_path.ends_with(".h");
+                (if is_header { 0 } else { 1 }, line_count)
+            });
+
+        match best_match {
+            Some((_, _, _, Some(types))) => Ok(types),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Find ALL functions by name at a specific git commit, excluding declarations
+    pub async fn find_all_functions_git_aware(
+        &self,
+        name: &str,
+        git_sha: &str,
+    ) -> Result<Vec<FunctionInfo>> {
+        // Get workdir overlay matches first
+        let workdir_matches = self.workdir_find_all_functions(name);
+        let workdir_files: HashSet<String> = workdir_matches
+            .iter()
+            .map(|f| f.file_path.clone())
+            .collect();
+
+        // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full function records)
+        let unique_file_paths = self
+            .symbol_filename_store
+            .get_filenames_for_symbol(name)
+            .await?;
+        if unique_file_paths.is_empty() && workdir_matches.is_empty() {
+            return Ok(Vec::new());
+        }
+        if unique_file_paths.is_empty() {
+            return Ok(self.filter_implementations_only(workdir_matches));
+        }
+
+        tracing::debug!(
+            "find_all_functions_git_aware: Found {} unique files for function '{}'",
+            unique_file_paths.len(),
+            name
+        );
+
+        // Step 2: Resolve file paths to git hashes at target commit
+        let resolved_hashes = self
+            .resolve_git_file_hashes(&unique_file_paths, git_sha)
+            .await?;
+        if resolved_hashes.is_empty() {
+            tracing::warn!("No files resolved for '{}' at commit '{}'", name, git_sha);
+            // Fallback: get all functions and filter implementations
+            let all_functions = self
+                .function_store
+                .find_all_by_name_unfiltered(name)
+                .await?;
+            return Ok(self.filter_implementations_only(all_functions));
+        }
+
+        // Step 3: Direct targeted search for each (filename, git_hash) combination
+        let mut matches = Vec::new();
+        for (file_path, git_hash) in &resolved_hashes {
+            tracing::debug!(
+                "Searching for: name='{}' file='{}' hash='{}'",
+                name,
+                file_path,
+                git_hash
+            );
+            if let Some(func) = self
+                .function_store
+                .find_by_name_file_and_hash(name, file_path, git_hash)
+                .await?
+            {
+                tracing::debug!(
+                    "Found match: {} in {} (hash: {})",
+                    name,
+                    file_path,
+                    git_hash
+                );
+                matches.push(func);
+            }
+        }
+
+        // Step 4: Filter out declarations but keep all implementations
+        if matches.is_empty() {
+            tracing::warn!(
+                "No exact matches found for '{}' at commit '{}', falling back",
+                name,
+                git_sha
+            );
+            // Fallback: get all functions and filter implementations
+            let all_functions = self
+                .function_store
+                .find_all_by_name_unfiltered(name)
+                .await?;
+            return Ok(self.filter_implementations_only(all_functions));
+        }
+
+        // Filter out DB results from dirty/deleted files, then merge with workdir results
+        let mut merged: Vec<FunctionInfo> = workdir_matches;
+        for func in matches {
+            if !workdir_files.contains(&func.file_path) && !self.workdir_is_deleted(&func.file_path)
+            {
+                merged.push(func);
+            }
+        }
+
+        let implementations = self.filter_implementations_only(merged);
+        tracing::info!(
+            "Git-aware lookup succeeded: found {} implementations of '{}' at commit '{}'",
+            implementations.len(),
+            name,
+            git_sha
+        );
+        Ok(implementations)
+    }
+
+    /// Filter out declarations, keeping only function implementations
+    fn filter_implementations_only(&self, functions: Vec<FunctionInfo>) -> Vec<FunctionInfo> {
+        functions
+            .into_iter()
+            .filter(|func| {
+                // Macros (empty return_type) are always implementations
+                if func.return_type.is_empty() {
+                    return true;
+                }
+
+                // Filter criteria: exclude likely declarations
+                let span = func.line_end.saturating_sub(func.line_start);
+                let has_substantial_body = func.body.len() > 50; // More than just a declaration
+                let is_likely_declaration = span <= 1 && func.body.trim().ends_with(';');
+
+                // Keep functions that have substantial bodies and are not declarations
+                has_substantial_body && !is_likely_declaration
+            })
+            .collect()
+    }
+
+    /// Select the best function match, prioritizing definitions over declarations
+    fn select_best_function_match(&self, mut matches: Vec<FunctionInfo>) -> FunctionInfo {
+        if matches.len() == 1 {
+            return matches.into_iter().next().unwrap();
+        }
+
+        // Prioritize by multiple criteria
+        matches.sort_by(|a, b| {
+            // 1. Prefer .c files over .h files
+            let a_is_source = a.file_path.ends_with(".c");
+            let b_is_source = b.file_path.ends_with(".c");
+            if a_is_source != b_is_source {
+                return b_is_source.cmp(&a_is_source);
+            }
+
+            // 2. Prefer functions with bodies (implementations)
+            let a_span = a.line_end.saturating_sub(a.line_start);
+            let b_span = b.line_end.saturating_sub(b.line_start);
+            let a_has_body = a_span > 0 && a.body.len() > 50;
+            let b_has_body = b_span > 0 && b.body.len() > 50;
+            if a_has_body != b_has_body {
+                return b_has_body.cmp(&a_has_body);
+            }
+
+            // 3. Prefer functions with parameters
+            let a_has_params = !a.parameters.is_empty();
+            let b_has_params = !b.parameters.is_empty();
+            if a_has_params != b_has_params {
+                return b_has_params.cmp(&a_has_params);
+            }
+
+            // 4. Prefer longer bodies (more implementation detail)
+            b.body.len().cmp(&a.body.len())
+        });
+
+        tracing::debug!(
+            "Selected best match from {} candidates: {} in {}",
+            matches.len(),
+            matches[0].name,
+            matches[0].file_path
+        );
+
+        matches.into_iter().next().unwrap()
+    }
+
+    /// Find all functions by name without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return multiple outdated versions.
+    /// For normal operations, use `find_all_functions_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns ALL indexed versions of functions with the given name across all commits,
+    /// which may include outdated versions that don't match your working directory.
+    pub async fn find_all_functions(&self, name: &str) -> Result<Vec<FunctionInfo>> {
+        self.function_store.find_all_by_name(name).await
+    }
+
+    /// Get access to the vector store for dimension verification
+    pub async fn get_vector_store(&self) -> Result<VectorStore> {
+        Ok(VectorStore::new(self.connection.clone()))
+    }
+
+    pub async fn get_all_functions(&self) -> Result<Vec<FunctionInfo>> {
+        self.function_store.get_all().await
+    }
+
+    pub async fn get_all_functions_metadata_only(&self) -> Result<Vec<FunctionInfo>> {
+        self.function_store.get_all_metadata_only().await
+    }
+
+    /// Search for functions using fuzzy matching without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_functions_fuzzy_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns fuzzy matches across all indexed commits without filtering by git history.
+    /// Results may include functions that have been deleted, renamed, or modified.
+    pub async fn search_functions_fuzzy(&self, pattern: &str) -> Result<Vec<FunctionInfo>> {
+        self.search_manager.search_functions_fuzzy(pattern).await
+    }
+
+    pub async fn search_functions_fuzzy_git_aware(
+        &self,
+        pattern: &str,
+        git_sha: &str,
+    ) -> Result<Vec<FunctionInfo>> {
+        self.search_manager
+            .search_functions_fuzzy_git_aware(pattern, git_sha)
+            .await
+    }
+
+    pub async fn update_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
+        self.vector_search_manager.update_vectors(vectorizer).await
+    }
+
+    pub async fn update_commit_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
+        self.vector_search_manager
+            .update_commit_vectors(vectorizer)
+            .await
+    }
+
+    pub async fn update_lore_vectors(&self, vectorizer: &CodeVectorizer) -> Result<()> {
+        self.vector_search_manager
+            .update_lore_vectors(vectorizer)
+            .await
+    }
+
+    pub async fn search_similar_commits(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(crate::types::GitCommitInfo, f32)>> {
+        self.vector_search_manager
+            .search_similar_commits(query_vector, limit)
+            .await
+    }
+
+    pub async fn search_similar_lore_emails(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+        filters: &crate::database::search::LoreEmailFilters<'_>,
+    ) -> Result<Vec<(crate::types::LoreEmailInfo, f32)>> {
+        self.vector_search_manager
+            .search_similar_lore_emails(query_vector, limit, filters)
+            .await
+    }
+
+    pub async fn search_similar_functions_with_scores(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+        filter: Option<String>,
+    ) -> Result<Vec<crate::database::search::FunctionMatch>> {
+        self.vector_search_manager
+            .search_similar_functions_with_scores(query_vector, limit, filter)
+            .await
+    }
+
+    pub async fn search_similar_functions(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+        filter: Option<String>,
+    ) -> Result<Vec<FunctionInfo>> {
+        self.vector_search_manager
+            .search_similar_functions(query_vector, limit, filter)
+            .await
+    }
+
+    pub async fn search_similar_by_name(
+        &self,
+        vectorizer: &CodeVectorizer,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<FunctionInfo>> {
+        self.vector_search_manager
+            .search_similar_by_name(vectorizer, name, limit)
+            .await
+    }
+
+    // Type operations
+    pub async fn insert_types(&self, types: Vec<TypeInfo>) -> Result<()> {
+        // Extract unique type definitions and store them in content table for deduplication
+        let mut unique_definitions = std::collections::HashSet::new();
+        for type_info in &types {
+            if !type_info.definition.is_empty() {
+                unique_definitions.insert(type_info.definition.clone());
+            }
+        }
+
+        // Store unique type definitions in content table
+        if !unique_definitions.is_empty() {
+            let unique_count = unique_definitions.len();
+            let content_items: Vec<crate::database::content::ContentInfo> = unique_definitions
+                .into_iter()
+                .map(|definition| crate::database::content::ContentInfo {
+                    blake3_hash: crate::hash::compute_blake3_hash(&definition),
+                    content: definition,
+                })
+                .collect();
+
+            // Insert content items with batch existence checking
+            if let Err(e) = self.content_store.insert_batch(content_items).await {
+                tracing::warn!("Failed to populate content table during insertion: {}", e);
+                // Continue with insertion even if content storage fails
+            } else {
+                tracing::debug!(
+                    "Successfully populated content table with {} unique type definitions",
+                    unique_count
+                );
+            }
+        }
+
+        // Extract (type_name, filename) pairs for symbol_filename table
+        let type_filename_pairs: Vec<(String, String)> = types
+            .iter()
+            .map(|t| (t.name.clone(), t.file_path.clone()))
+            .collect();
+
+        // Insert types as usual (keeping existing definition column for now)
+        self.type_store.insert_batch(types).await?;
+
+        // Insert into symbol_filename table
+        self.symbol_filename_store
+            .insert_batch(type_filename_pairs)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Find a type by name without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return an outdated version.
+    /// For normal operations, use `find_type_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns the first matching type found without considering git history.
+    /// The returned type may not match the version in your working directory.
+    pub async fn find_type(&self, name: &str) -> Result<Option<TypeInfo>> {
+        self.type_store.find_by_name(name).await
+    }
+
+    pub async fn find_type_git_aware(&self, name: &str, git_sha: &str) -> Result<Option<TypeInfo>> {
+        // Check workdir overlay first
+        if let Some(ty) = self.workdir_find_type(name) {
+            return Ok(Some(ty));
+        }
+        // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full type records)
+        let unique_file_paths = self
+            .symbol_filename_store
+            .get_filenames_for_symbol(name)
+            .await?;
+        if unique_file_paths.is_empty() {
+            return Ok(None);
+        }
+
+        // Step 2: Resolve file paths to git hashes at target commit
+        let resolved_hashes = self
+            .resolve_git_file_hashes(&unique_file_paths, git_sha)
+            .await?;
+        if resolved_hashes.is_empty() {
+            tracing::info!(
+                "No files resolved for type '{}' at commit '{}' - falling back to non-git lookup",
+                name,
+                git_sha
+            );
+            // Fallback: do a regular find to get any available type
+            return self.find_type(name).await;
+        }
+
+        // Step 3: Direct targeted search using git hashes
+        let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
+        let types = self
+            .type_store
+            .find_by_git_hashes(&hash_values, Some(name), None)
+            .await?;
+
+        if types.is_empty() {
+            tracing::info!(
+                "No exact matches found for type '{}' at commit '{}', falling back to non-git lookup",
+                name,
+                git_sha
+            );
+            // Fallback: do a regular find to get any available type
+            return self.find_type(name).await;
+        }
+
+        // Return the first match (types typically don't have the same prioritization as functions)
+        Ok(types.into_iter().next())
+    }
+
+    pub async fn get_all_types(&self) -> Result<Vec<TypeInfo>> {
+        self.type_store.get_all().await
+    }
+
+    /// Get all types without resolving content hashes - much faster for dumps
+    pub async fn get_all_types_metadata_only(&self) -> Result<Vec<TypeInfo>> {
+        self.type_store.get_all_metadata_only().await
+    }
+
+    /// Count all types without resolving content - much faster for counts
+    pub async fn count_types(&self) -> Result<usize> {
+        self.type_store.count_all().await
+    }
+
+    /// Count all functions without resolving content - much faster for counts
+    pub async fn count_functions(&self) -> Result<usize> {
+        self.function_store.count_all().await
+    }
+
+    /// Count all typedefs without resolving content - much faster for counts
+    pub async fn count_typedefs(&self) -> Result<usize> {
+        self.typedef_store.count_all().await
+    }
+
+    /// Search for types using fuzzy matching without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_types_fuzzy_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns fuzzy matches across all indexed commits without filtering by git history.
+    /// Results may include types that have been deleted, renamed, or modified.
+    pub async fn search_types_fuzzy(&self, pattern: &str) -> Result<Vec<TypeInfo>> {
+        self.search_manager.search_types_fuzzy(pattern).await
+    }
+
+    pub async fn search_types_fuzzy_git_aware(
+        &self,
+        pattern: &str,
+        git_sha: &str,
+    ) -> Result<Vec<TypeInfo>> {
+        self.search_manager
+            .search_types_fuzzy_git_aware(pattern, git_sha)
+            .await
+    }
+
+    pub async fn search_types_by_kind(&self, kind: &str) -> Result<Vec<TypeInfo>> {
+        self.search_manager.search_types_by_kind(kind).await
+    }
+
+    pub async fn type_exists(&self, name: &str, kind: &str, file_path: &str) -> Result<bool> {
+        self.type_store.exists(name, kind, file_path).await
+    }
+
+    // Typedef operations
+    pub async fn insert_typedefs(&self, typedefs: Vec<TypedefInfo>) -> Result<()> {
+        // Extract unique typedef definitions and store them in content table for deduplication
+        let mut unique_definitions = std::collections::HashSet::new();
+        for typedef_info in &typedefs {
+            if !typedef_info.definition.is_empty() {
+                unique_definitions.insert(typedef_info.definition.clone());
+            }
+        }
+
+        // Store unique typedef definitions in content table
+        if !unique_definitions.is_empty() {
+            let unique_count = unique_definitions.len();
+            let content_items: Vec<crate::database::content::ContentInfo> = unique_definitions
+                .into_iter()
+                .map(|definition| crate::database::content::ContentInfo {
+                    blake3_hash: crate::hash::compute_blake3_hash(&definition),
+                    content: definition,
+                })
+                .collect();
+
+            // Insert content items with batch existence checking
+            if let Err(e) = self.content_store.insert_batch(content_items).await {
+                tracing::warn!("Failed to populate content table during insertion: {}", e);
+                // Continue with insertion even if content storage fails
+            } else {
+                tracing::debug!(
+                    "Successfully populated content table with {} unique typedef definitions",
+                    unique_count
+                );
+            }
+        }
+
+        // Extract (typedef_name, filename) pairs for symbol_filename table
+        let typedef_filename_pairs: Vec<(String, String)> = typedefs
+            .iter()
+            .map(|td| (td.name.clone(), td.file_path.clone()))
+            .collect();
+
+        // Insert typedefs as usual (keeping existing definition column for now)
+        self.typedef_store.insert_batch(typedefs).await?;
+
+        // Insert into symbol_filename table
+        self.symbol_filename_store
+            .insert_batch(typedef_filename_pairs)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Find a typedef by name without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return an outdated version.
+    /// For normal operations, use `find_typedef_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns the first matching typedef found without considering git history.
+    /// The returned typedef may not match the version in your working directory.
+    pub async fn find_typedef(&self, name: &str) -> Result<Option<TypedefInfo>> {
+        self.typedef_store.find_by_name(name).await
+    }
+
+    pub async fn find_typedef_git_aware(
+        &self,
+        name: &str,
+        git_sha: &str,
+    ) -> Result<Option<TypedefInfo>> {
+        // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full typedef records)
+        let unique_file_paths = self
+            .symbol_filename_store
+            .get_filenames_for_symbol(name)
+            .await?;
+        if unique_file_paths.is_empty() {
+            return Ok(None);
+        }
+
+        // Step 2: Resolve file paths to git hashes at target commit
+        let resolved_hashes = self
+            .resolve_git_file_hashes(&unique_file_paths, git_sha)
+            .await?;
+        if resolved_hashes.is_empty() {
+            tracing::info!(
+                "No files resolved for typedef '{}' at commit '{}' - falling back to non-git lookup",
+                name,
+                git_sha
+            );
+            // Fallback: do a regular find to get any available typedef
+            return self.find_typedef(name).await;
+        }
+
+        // Step 3: Direct targeted search using git hashes
+        let hash_values: Vec<String> = resolved_hashes.values().cloned().collect();
+        let typedefs = self
+            .typedef_store
+            .find_by_git_hashes(&hash_values, Some(name))
+            .await?;
+
+        if typedefs.is_empty() {
+            tracing::info!(
+                "No exact matches found for typedef '{}' at commit '{}', falling back to non-git lookup",
+                name,
+                git_sha
+            );
+            // Fallback: do a regular find to get any available typedef
+            return self.find_typedef(name).await;
+        }
+
+        // Return the first match
+        Ok(typedefs.into_iter().next())
+    }
+
+    pub async fn get_all_typedefs(&self) -> Result<Vec<TypedefInfo>> {
+        self.typedef_store.get_all().await
+    }
+
+    /// Search for typedefs using fuzzy matching without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_typedefs_fuzzy_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns fuzzy matches across all indexed commits without filtering by git history.
+    /// Results may include typedefs that have been deleted, renamed, or modified.
+    pub async fn search_typedefs_fuzzy(&self, pattern: &str) -> Result<Vec<TypedefInfo>> {
+        self.search_manager.search_typedefs_fuzzy(pattern).await
+    }
+
+    pub async fn search_typedefs_fuzzy_git_aware(
+        &self,
+        pattern: &str,
+        git_sha: &str,
+    ) -> Result<Vec<TypedefInfo>> {
+        self.search_manager
+            .search_typedefs_fuzzy_git_aware(pattern, git_sha)
+            .await
+    }
+
+    pub async fn typedef_exists(&self, name: &str, file_path: &str) -> Result<bool> {
+        self.typedef_store.exists(name, file_path).await
+    }
+
+    /// Search types using regex patterns on the name column without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_types_regex_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns regex matches across all indexed commits without filtering by git history.
+    /// Results may include types that have been deleted, renamed, or modified.
+    pub async fn search_types_regex(&self, pattern: &str) -> Result<Vec<TypeInfo>> {
+        self.search_manager.search_types_regex(pattern).await
+    }
+
+    /// Search types using regex patterns on the name column (git-aware)
+    pub async fn search_types_regex_git_aware(
+        &self,
+        pattern: &str,
+        git_sha: &str,
+    ) -> Result<Vec<TypeInfo>> {
+        let workdir_matches = self.workdir_find_types_regex(pattern);
+        let workdir_files: HashSet<String> = workdir_matches
+            .iter()
+            .map(|t| t.file_path.clone())
+            .collect();
+
+        let mut db_results = self
+            .search_manager
+            .search_types_regex_git_aware(pattern, git_sha)
+            .await?;
+
+        // Filter out DB results from dirty/deleted files, then prepend workdir matches
+        db_results.retain(|t| {
+            !workdir_files.contains(&t.file_path) && !self.workdir_is_deleted(&t.file_path)
+        });
+
+        let mut merged = workdir_matches;
+        merged.extend(db_results);
+        Ok(merged)
+    }
+
+    /// Search typedefs using regex patterns on the name column without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_typedefs_regex_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns regex matches across all indexed commits without filtering by git history.
+    /// Results may include typedefs that have been deleted, renamed, or modified.
+    pub async fn search_typedefs_regex(&self, pattern: &str) -> Result<Vec<TypedefInfo>> {
+        self.search_manager.search_typedefs_regex(pattern).await
+    }
+
+    /// Search typedefs using regex patterns on the name column (git-aware)
+    pub async fn search_typedefs_regex_git_aware(
+        &self,
+        pattern: &str,
+        git_sha: &str,
+    ) -> Result<Vec<TypedefInfo>> {
+        self.search_manager
+            .search_typedefs_regex_git_aware(pattern, git_sha)
+            .await
+    }
+
+    // Metadata-only insertion methods (skip content storage for performance)
+    async fn insert_functions_metadata_only(&self, functions: Vec<FunctionInfo>) -> Result<()> {
+        // Insert functions metadata
+        self.function_store.insert_metadata_only(functions).await?;
+        Ok(())
+    }
+
+    async fn insert_types_metadata_only(&self, types: Vec<TypeInfo>) -> Result<()> {
+        self.type_store.insert_metadata_only(types).await
+    }
+
+    /// Search functions using regex patterns on the name column without git awareness (non-git-aware)
+    ///
+    /// **WARNING**: This method does NOT filter by git commit and may return outdated versions.
+    /// For normal operations, use `search_functions_regex_git_aware()` instead.
+    ///
+    /// # When to Use This Method
+    /// - Fallback when git SHA cannot be determined (not in a git repository)
+    /// - Administrative/debugging operations that need to see all versions
+    /// - Operations that explicitly require seeing historical data across commits
+    ///
+    /// # Behavior
+    /// Returns regex matches across all indexed commits without filtering by git history.
+    /// Results may include functions that have been deleted, renamed, or modified.
+    pub async fn search_functions_regex(&self, pattern: &str) -> Result<Vec<FunctionInfo>> {
+        self.search_manager.search_functions_regex(pattern).await
+    }
+
+    /// Search functions using regex patterns on the name column (git-aware)
+    pub async fn search_functions_regex_git_aware(
+        &self,
+        pattern: &str,
+        git_sha: &str,
+    ) -> Result<Vec<FunctionInfo>> {
+        let workdir_matches = self.workdir_find_functions_regex(pattern);
+        let workdir_files: HashSet<String> = workdir_matches
+            .iter()
+            .map(|f| f.file_path.clone())
+            .collect();
+
+        let mut db_results = self
+            .search_manager
+            .search_functions_regex_git_aware(pattern, git_sha)
+            .await?;
+
+        db_results.retain(|f| {
+            !workdir_files.contains(&f.file_path) && !self.workdir_is_deleted(&f.file_path)
+        });
+
+        let mut merged = workdir_matches;
+        merged.extend(db_results);
+        Ok(merged)
+    }
+
+    // Call relationship operations
+    // Call relationship insertion/resolution methods removed - call relationships are now embedded in function JSON columns
+
+    pub async fn get_function_callers(&self, function_name: &str) -> Result<Vec<String>> {
+        let total_start = std::time::Instant::now();
+
+        // Use efficient filtering: find functions whose calls JSON contains the target function name
+        let escaped_name = function_name.replace("'", "''"); // SQL escape
+
+        let open_table_start = std::time::Instant::now();
+        let table = self.connection.open_table("functions").execute().await?;
+        tracing::info!(
+            "get_function_callers: open_table took {:?}",
+            open_table_start.elapsed()
+        );
+
+        // Filter for functions whose calls column contains the exact function name
+        // Match as complete JSON array element: "name", or "name"]
+        // This avoids false positives like "name_suffix" or "prefix_name"
+        let filter = format!(
+            "calls IS NOT NULL AND (calls LIKE '%\"{escaped_name}\",%' OR calls LIKE '%\"{escaped_name}\"]%')"
+        );
+
+        let query_start = std::time::Instant::now();
+        let results = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        tracing::info!(
+            "get_function_callers: query and collect took {:?}",
+            query_start.elapsed()
+        );
+
+        let process_start = std::time::Instant::now();
+        let mut callers = std::collections::HashSet::new();
+        for batch in results {
+            if batch.num_rows() > 0 {
+                let name_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                // Find the calls column (should be at index based on schema)
+                let calls_column_idx = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "calls")
+                    .ok_or_else(|| anyhow::anyhow!("calls column not found in functions table"))?;
+                let calls_array = batch
+                    .column(calls_column_idx)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    if !calls_array.is_null(i) {
+                        let caller_name = name_array.value(i).to_string();
+                        let calls_json = calls_array.value(i);
+
+                        // Parse JSON and verify it actually contains function_name
+                        // (the LIKE filter might have false positives)
+                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
+                            if calls_list.contains(&function_name.to_string()) {
+                                callers.insert(caller_name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            "get_function_callers: batch processing took {:?}",
+            process_start.elapsed()
+        );
+
+        let result: Vec<String> = callers.into_iter().collect();
+        tracing::info!(
+            "get_function_callers: TOTAL time {:?}, found {} callers",
+            total_start.elapsed(),
+            result.len()
+        );
+        Ok(result)
+    }
+
+    pub async fn get_function_callers_git_aware(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+    ) -> Result<Vec<String>> {
+        // Collect callers from workdir overlay
+        let workdir_callers = self.workdir_find_callers(function_name);
+        let mut caller_names: Vec<String> =
+            workdir_callers.iter().map(|f| f.name.clone()).collect();
+
+        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        if !git_manifest.is_empty() {
+            let db_callers = self
+                .get_function_callers_with_manifest(function_name, &git_manifest)
+                .await?;
+            for name in db_callers {
+                if !caller_names.contains(&name) {
+                    caller_names.push(name);
+                }
+            }
+        }
+        Ok(caller_names)
+    }
+
+    // Optimized methods for call chain analysis
+
+    /// Get functions that have no callers (entry points)
+    pub async fn get_entry_point_functions(&self) -> Result<Vec<String>> {
+        // New schema: find functions that make calls but are never called by others
+        let table = self.connection.open_table("functions").execute().await?;
+        let results = table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut functions_with_calls = std::collections::HashSet::new();
+        let mut functions_that_are_called = std::collections::HashSet::new();
+
+        for batch in results {
+            if batch.num_rows() > 0 {
+                let name_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                // Find the calls column
+                let calls_column_idx = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "calls")
+                    .ok_or_else(|| anyhow::anyhow!("calls column not found in functions table"))?;
+                let calls_array = batch
+                    .column(calls_column_idx)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let function_name = name_array.value(i).to_string();
+
+                    // Check if this function makes calls
+                    if !calls_array.is_null(i) {
+                        let calls_json = calls_array.value(i);
+                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
+                            if !calls_list.is_empty() {
+                                functions_with_calls.insert(function_name.clone());
+                                // Add all called functions to the set
+                                for called_func in calls_list {
+                                    functions_that_are_called.insert(called_func);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Entry points are functions that make calls but are never called
+        let entry_points: Vec<String> = functions_with_calls
+            .difference(&functions_that_are_called)
+            .cloned()
+            .collect();
+
+        Ok(entry_points)
+    }
+
+    /// Get functions by a list of names (batch lookup)
+    pub async fn get_functions_by_names(
+        &self,
+        names: &[String],
+    ) -> Result<std::collections::HashMap<String, FunctionInfo>> {
+        self.function_store.get_by_names(names).await
+    }
+
+    /// Get types by a list of names (batch lookup)
+    pub async fn get_types_by_names(
+        &self,
+        names: &[String],
+    ) -> Result<std::collections::HashMap<String, TypeInfo>> {
+        self.type_store.get_by_names(names).await
+    }
+
+    /// Get typedefs by a list of names (batch lookup)
+    pub async fn get_typedefs_by_names(
+        &self,
+        names: &[String],
+    ) -> Result<std::collections::HashMap<String, TypedefInfo>> {
+        self.typedef_store.get_by_names(names).await
+    }
+
+    /// Efficiently collect functions in a call chain from a starting function
+    /// Uses different strategies based on database size
+    pub async fn collect_callchain_functions(
+        &self,
+        start_function: &str,
+        max_depth: usize,
+        include_forward: bool,
+        include_reverse: bool,
+        git_sha: Option<&str>,
+    ) -> Result<std::collections::HashSet<String>> {
+        // For small databases (< 1000 functions), use the old full-scan approach
+        // For large databases, use targeted queries
+        let function_count = self.get_function_count().await?;
+
+        if function_count < 1000 {
+            // Small database: use in-memory approach (faster for small datasets)
+            self.collect_callchain_functions_in_memory(
+                start_function,
+                max_depth,
+                include_forward,
+                include_reverse,
+                git_sha,
+            )
+            .await
+        } else {
+            // Large database: use targeted queries
+            self.collect_callchain_functions_targeted(
+                start_function,
+                max_depth,
+                include_forward,
+                include_reverse,
+                git_sha,
+            )
+            .await
+        }
+    }
+
+    /// Get total function count (cached/efficient)
+    async fn get_function_count(&self) -> Result<usize> {
+        let table = self.connection.open_table("functions").execute().await?;
+        Ok(table.count_rows(None).await?)
+    }
+
+    /// Use full in-memory approach (good for small databases)
+    async fn collect_callchain_functions_in_memory(
+        &self,
+        start_function: &str,
+        max_depth: usize,
+        include_forward: bool,
+        include_reverse: bool,
+        git_sha: Option<&str>,
+    ) -> Result<std::collections::HashSet<String>> {
+        // For small databases, we'll still use the targeted approach with call store
+        // since the embedded call fields have been removed
+        self.collect_callchain_functions_targeted(
+            start_function,
+            max_depth,
+            include_forward,
+            include_reverse,
+            git_sha,
+        )
+        .await
+    }
+
+    /// Use targeted queries (good for large databases) - optimized with git manifest for 10-100x speedup
+    async fn collect_callchain_functions_targeted(
+        &self,
+        start_function: &str,
+        max_depth: usize,
+        include_forward: bool,
+        include_reverse: bool,
+        git_sha: Option<&str>,
+    ) -> Result<std::collections::HashSet<String>> {
+        // Optimize git-aware operations by generating manifest once
+        let git_manifest = if let Some(sha) = git_sha {
+            tracing::info!(
+                "Generating git manifest for callchain optimization at commit: {}",
+                sha
+            );
+            Some(self.generate_git_manifest(sha).await?)
+        } else {
+            None
+        };
+
+        let mut result = std::collections::HashSet::new();
+        let mut to_visit = std::collections::VecDeque::new();
+        let mut visited = std::collections::HashSet::new();
+
+        to_visit.push_back((start_function.to_string(), 0));
+        result.insert(start_function.to_string());
+
+        while let Some((func_name, depth)) = to_visit.pop_front() {
+            if depth >= max_depth || visited.contains(&func_name) {
+                continue;
+            }
+
+            visited.insert(func_name.clone());
+
+            // Get function details to find call relationships
+            let function_exists = if let Some(manifest) = &git_manifest {
+                self.function_exists_in_manifest(&func_name, manifest)
+                    .await?
+            } else {
+                self.find_function(&func_name).await?.is_some()
+            };
+
+            if function_exists {
+                if include_forward {
+                    let callees = if let Some(manifest) = &git_manifest {
+                        self.get_function_callees_with_manifest(&func_name, manifest)
+                            .await?
+                    } else {
+                        self.get_function_callees(&func_name).await?
+                    };
+                    for callee in callees {
+                        if !result.contains(&callee) {
+                            result.insert(callee.clone());
+                            to_visit.push_back((callee, depth + 1));
+                        }
+                    }
+                }
+
+                if include_reverse {
+                    let callers = if let Some(manifest) = &git_manifest {
+                        self.get_function_callers_with_manifest(&func_name, manifest)
+                            .await?
+                    } else {
+                        self.get_function_callers(&func_name).await?
+                    };
+                    for caller in callers {
+                        if !result.contains(&caller) {
+                            result.insert(caller.clone());
+                            to_visit.push_back((caller, depth + 1));
+                        }
+                    }
+                }
+            }
+            // Note: Macros are now stored as functions, so no separate macro check needed
+        }
+
+        Ok(result)
+    }
+
+    pub async fn get_function_callees(&self, function_name: &str) -> Result<Vec<String>> {
+        // Get all functions with this name and select the best one (prefers definitions over declarations)
+        let all_matches = self
+            .function_store
+            .find_all_by_name_unfiltered(function_name)
+            .await?;
+        if all_matches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Use the same smart selection logic to prefer implementations over declarations
+        let best_match = self.select_best_function_match(all_matches);
+
+        // Get the calls from the best match (already deserialized as Vec<String>)
+        if let Some(ref calls_list) = best_match.calls {
+            return Ok(calls_list.clone());
+        }
+
+        Ok(Vec::new())
+    }
+
+    pub async fn get_function_callees_git_aware(
+        &self,
+        function_name: &str,
+        git_sha: &str,
+    ) -> Result<Vec<String>> {
+        // Check workdir overlay first — if the function is in a dirty file, use its callees
+        if let Some(callees) = self.workdir_find_callees(function_name) {
+            return Ok(callees);
+        }
+        let git_manifest = self.generate_git_manifest(git_sha).await?;
+        if git_manifest.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.get_function_callees_with_manifest(function_name, &git_manifest)
+            .await
+    }
+
+    pub async fn get_all_call_relationships(&self) -> Result<Vec<CallRelationship>> {
+        // New schema: reconstruct call relationships from embedded JSON in functions table
+        let table = self.connection.open_table("functions").execute().await?;
+        let results = table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut all_relationships = Vec::new();
+
+        for batch in results {
+            if batch.num_rows() > 0 {
+                let name_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let git_file_hash_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                // Find the calls column
+                let calls_column_idx = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "calls")
+                    .ok_or_else(|| anyhow::anyhow!("calls column not found in functions table"))?;
+                let calls_array = batch
+                    .column(calls_column_idx)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let caller_name = name_array.value(i).to_string();
+                    let caller_git_file_hash = git_file_hash_array.value(i).to_string();
+
+                    if !calls_array.is_null(i) {
+                        let calls_json = calls_array.value(i);
+                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
+                            for callee_name in calls_list {
+                                // For now, we can't easily get callee git hash without additional lookups
+                                // This is a limitation of the new schema - we'd need to do individual lookups
+                                all_relationships.push(CallRelationship {
+                                    caller: caller_name.clone(),
+                                    callee: callee_name,
+                                    caller_git_file_hash: caller_git_file_hash.clone(),
+                                    callee_git_file_hash: None, // Would require lookup
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(all_relationships)
+    }
+
+    /// Run database optimization and rebuild indices
+    pub async fn optimize_database(&self) -> Result<()> {
+        use colored::Colorize;
+
+        tracing::info!(
+            "\n{}",
+            "═══ DATABASE OPTIMIZATION STARTED ═══".yellow().bold()
+        );
+        let start_time = std::time::Instant::now();
+        tracing::info!("Running database optimization...");
+
+        // Rebuild all scalar indices to ensure they're optimal
+        tracing::info!("{}", "  → Rebuilding scalar indices...".cyan());
+        self.rebuild_indices().await?;
+        tracing::info!("{}", "  ✓ Scalar indices rebuilt".green());
+
+        // Run table optimization
+        tracing::info!("{}", "  → Optimizing tables...".cyan());
+        self.optimize_tables().await?;
+        tracing::info!("{}", "  ✓ Tables optimized".green());
+
+        // Compact and cleanup (triggers compression)
+        tracing::info!("{}", "  → Compacting and pruning old versions...".cyan());
+        self.compact_and_cleanup().await?;
+        tracing::info!("{}", "  ✓ Compaction complete".green());
+
+        let elapsed = start_time.elapsed();
+        tracing::info!(
+            "{}",
+            format!(
+                "═══ DATABASE OPTIMIZATION COMPLETE ({:.1}s) ═══\n",
+                elapsed.as_secs_f64()
+            )
+            .yellow()
+            .bold()
+        );
+        tracing::info!(
+            "Database optimization complete in {:.1}s",
+            elapsed.as_secs_f64()
+        );
+        Ok(())
+    }
+
+    /// Check if database needs optimization based on fragment statistics
+    /// Returns (needs_optimization, diagnostic_message)
+    pub async fn check_optimization_health(&self) -> Result<(bool, String)> {
+        use colored::Colorize;
+
+        let table_names = self.connection.table_names().execute().await?;
+        let mut needs_optimization = false;
+        let mut messages = Vec::new();
+
+        // Tables to check (prioritize the largest ones)
+        let critical_tables = [
+            "functions",
+            "types",
+            "vectors",
+            "commit_vectors",
+            "lore_vectors",
+            "processed_files",
+            "git_commits",
+            "lore",
+            "symbol_filename",
+        ];
+
+        let mut total_fragments = 0;
+        let mut total_small_fragments = 0;
+
+        for table_name in &critical_tables {
+            if !table_names.iter().any(|n| n == table_name) {
+                continue;
+            }
+
+            let table = self.connection.open_table(*table_name).execute().await?;
+
+            // Get table statistics
+            match table.stats().await {
+                Ok(stats) => {
+                    let frag_stats = &stats.fragment_stats;
+                    total_fragments += frag_stats.num_fragments;
+                    total_small_fragments += frag_stats.num_small_fragments;
+
+                    // Heuristics for when optimization is needed:
+                    // 1. More than 600 fragments triggers auto-optimization
+                    //    (LanceDB recommends <100 for optimal performance, but we use 600
+                    //     to avoid over-optimizing during incremental updates)
+                    if frag_stats.num_fragments > 600 {
+                        needs_optimization = true;
+                        messages.push(format!(
+                            "{}: {} fragments (auto-optimize threshold: 600)",
+                            table_name.yellow(),
+                            frag_stats.num_fragments.to_string().red()
+                        ));
+                    }
+
+                    // 2. More than 50% small fragments (< 100K rows each)
+                    if frag_stats.num_fragments > 0 {
+                        let small_fragment_pct = (frag_stats.num_small_fragments as f64
+                            / frag_stats.num_fragments as f64)
+                            * 100.0;
+                        if small_fragment_pct > 50.0 && frag_stats.num_small_fragments > 10 {
+                            needs_optimization = true;
+                            messages.push(format!(
+                                "{}: {:.1}% small fragments ({}/{})",
+                                table_name.yellow(),
+                                small_fragment_pct,
+                                frag_stats.num_small_fragments.to_string().red(),
+                                frag_stats.num_fragments
+                            ));
+                        }
+                    }
+
+                    // 3. Very small mean fragment size suggests many small inserts
+                    if frag_stats.lengths.mean < 1000 && stats.num_rows > 10000 {
+                        needs_optimization = true;
+                        messages.push(format!(
+                            "{}: small mean fragment size ({} rows/fragment)",
+                            table_name.yellow(),
+                            frag_stats.lengths.mean.to_string().red()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get stats for table {}: {}", table_name, e);
+                }
+            }
+        }
+
+        // Also check content shards (aggregate stats)
+        let mut content_fragments = 0;
+        let mut content_small_fragments = 0;
+        for shard in 0..16u8 {
+            let table_name = format!("content_{shard}");
+            if !table_names.iter().any(|n| n == &table_name) {
+                continue;
+            }
+
+            let table = self.connection.open_table(&table_name).execute().await?;
+            if let Ok(stats) = table.stats().await {
+                content_fragments += stats.fragment_stats.num_fragments;
+                content_small_fragments += stats.fragment_stats.num_small_fragments;
+            }
+        }
+
+        if content_fragments > 0 {
+            total_fragments += content_fragments;
+            total_small_fragments += content_small_fragments;
+
+            // Content shards are expected to have more fragments due to sharding
+            // But still check if they're excessive (16 shards × 600 = 9600, use 3000 as threshold)
+            if content_fragments > 3000 {
+                needs_optimization = true;
+                messages.push(format!(
+                    "{}: {} fragments across 16 shards (threshold: 3000)",
+                    "content shards".yellow(),
+                    content_fragments.to_string().red()
+                ));
+            }
+        }
+
+        // Build summary message
+        let summary = if needs_optimization {
+            let mut msg = format!("{}\n", "Optimizing database...".yellow());
+            for message in &messages {
+                msg.push_str(&format!("  • {}\n", message));
+            }
+            msg.push_str(&format!(
+                "\nTotal: {} fragments ({} small)\n",
+                total_fragments.to_string().yellow(),
+                total_small_fragments.to_string().yellow()
+            ));
+            msg
+        } else {
+            format!(
+                "{} Database is healthy ({} fragments, {} small)\n",
+                "✓".green().bold(),
+                total_fragments.to_string().green(),
+                total_small_fragments.to_string().green()
+            )
+        };
+
+        Ok((needs_optimization, summary))
+    }
+
+    /// Get database storage statistics and compression info
+    pub async fn get_storage_stats(&self) -> Result<()> {
+        let table_names = self.connection.table_names().execute().await?;
+        let mut total_rows = 0;
+
+        println!("{}", "=== Database Storage Statistics ===".bold().green());
+
+        // Process main tables
+        for table_name in &[
+            "functions",
+            "types",
+            "vectors",
+            "commit_vectors",
+            "lore_vectors",
+            "processed_files",
+            "git_commits",
+            "lore",
+            "symbol_filename",
+        ] {
+            if table_names.iter().any(|n| n == table_name) {
+                let table = self.connection.open_table(*table_name).execute().await?;
+                match table.count_rows(None).await {
+                    Ok(count) => {
+                        println!("{}: {} rows", table_name.cyan(), count.to_string().yellow());
+                        total_rows += count;
+
+                        // Estimate storage for functions table (largest consumer)
+                        if *table_name == "functions" {
+                            // Get vector statistics from the separate vectors table
+                            use crate::database::vectors::VectorStore;
+                            let vector_store = VectorStore::new(self.connection.clone());
+                            let total_vectors = vector_store.get_stats().await.unwrap_or(0);
+                            // Since we now store vectors by content hash, we can't directly
+                            // correlate with function count, so we'll estimate
+                            let functions_with_vectors = total_vectors; // Approximate
+                            let functions_without_vectors = count - functions_with_vectors;
+                            let actual_vector_storage = functions_with_vectors * 256 * 4; // bytes for actual vectors (model2vec)
+                            let est_text_storage = count * 2048; // rough estimate for bodies
+
+                            println!(
+                                "  Functions with vectors: {}",
+                                functions_with_vectors.to_string().green()
+                            );
+                            println!(
+                                "  Functions without vectors: {}",
+                                functions_without_vectors.to_string().cyan()
+                            );
+                            println!(
+                                "  Vector storage: {} MB",
+                                (actual_vector_storage / 1024 / 1024).to_string().yellow()
+                            );
+                            println!(
+                                "  Estimated text storage: {} MB",
+                                (est_text_storage / 1024 / 1024).to_string().yellow()
+                            );
+
+                            if functions_with_vectors > 0 {
+                                let vector_efficiency =
+                                    (functions_with_vectors as f64 / count as f64) * 100.0;
+                                println!(
+                                    "  Vector coverage: {:.1}%",
+                                    vector_efficiency.to_string().bold().green()
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("{}: Error getting count - {}", table_name.red(), e);
+                    }
+                }
+            }
+        }
+
+        // Process content shard tables (content_0 through content_15) and aggregate stats
+        let mut total_content_rows = 0;
+        for shard in 0..16u8 {
+            let table_name = format!("content_{shard}");
+            let table = self.connection.open_table(&table_name).execute().await?;
+            match table.count_rows(None).await {
+                Ok(count) => {
+                    total_content_rows += count;
+                }
+                Err(e) => {
+                    println!("{}: Error getting count - {}", table_name.red(), e);
+                }
+            }
+        }
+
+        if total_content_rows > 0 {
+            println!(
+                "{}: {} rows (across 16 shards)",
+                "content".cyan(),
+                total_content_rows.to_string().yellow()
+            );
+            total_rows += total_content_rows;
+        }
+
+        println!(
+            "{}: {} rows",
+            "Total".bold(),
+            total_rows.to_string().yellow()
+        );
+        println!(
+            "\n{}",
+            "Note: LanceDB uses columnar compression (LZ4/ZSTD) automatically".bright_black()
+        );
+        println!(
+            "{}",
+            "Vectors are stored in a separate table for deduplication and efficiency"
+                .bright_black()
+        );
+
+        Ok(())
+    }
+
+    /// Optimize database files and consolidate data fragments
+    pub async fn compact_database(&self) -> Result<()> {
+        tracing::info!("Running database optimization to reduce file size...");
+
+        // Step 1: Run optimization and cleanup sequence
+        self.compact_and_cleanup().await?;
+
+        // Step 2: CRITICAL - Drop old table references and recreate to release handles
+        tracing::info!("Releasing old table handles and checking out latest versions...");
+
+        // Force recreation of table connections to release old version handles
+        // This is crucial for LanceDB garbage collection to work properly
+        let table_names = self.connection.table_names().execute().await?;
+
+        for table_name in &[
+            "functions",
+            "types",
+            "vectors",
+            "commit_vectors",
+            "lore_vectors",
+            "processed_files",
+            "git_commits",
+            "lore",
+            "symbol_filename",
+        ] {
+            if table_names.iter().any(|n| n == table_name) {
+                // Open table with fresh handle and checkout latest
+                match self.connection.open_table(*table_name).execute().await {
+                    Ok(table) => {
+                        // Checkout latest version to ensure we're not holding old handles
+                        if let Err(e) = table.checkout_latest().await {
+                            tracing::warn!("Could not checkout latest for {}: {}", table_name, e);
+                        }
+                        // Table handle will be dropped automatically when it goes out of scope
+                    }
+                    Err(e) => {
+                        tracing::warn!("Could not reopen table {}: {}", table_name, e);
+                    }
+                }
+            }
+        }
+
+        tracing::info!("Database optimization and handle cleanup complete");
+        Ok(())
+    }
+
+    /// Get compaction statistics
+    pub async fn get_compaction_stats(&self) -> Result<()> {
+        let table_names = self.connection.table_names().execute().await?;
+
+        println!(
+            "{}",
+            "=== Database Compaction Statistics ===".bold().green()
+        );
+
+        // Process main tables
+        for table_name in &[
+            "functions",
+            "types",
+            "vectors",
+            "commit_vectors",
+            "lore_vectors",
+            "processed_files",
+            "git_commits",
+            "lore",
+            "symbol_filename",
+        ] {
+            if table_names.iter().any(|n| n == table_name) {
+                let table = self.connection.open_table(*table_name).execute().await?;
+
+                match table.count_rows(None).await {
+                    Ok(count) => {
+                        println!("{}: {} rows", table_name.cyan(), count.to_string().yellow());
+
+                        // Try to get more detailed stats if available
+                        // Note: Specific LanceDB version info may not be accessible in all versions
+                    }
+                    Err(e) => {
+                        println!("{}: Error - {}", table_name.red(), e);
+                    }
+                }
+            }
+        }
+
+        // Process content shard tables (content_0 through content_15)
+        let mut total_content_rows = 0;
+        for shard in 0..16u8 {
+            let table_name = format!("content_{shard}");
+            let table = self.connection.open_table(&table_name).execute().await?;
+            match table.count_rows(None).await {
+                Ok(count) => {
+                    total_content_rows += count;
+                }
+                Err(e) => {
+                    println!("{}: Error - {}", table_name.red(), e);
+                }
+            }
+        }
+
+        if total_content_rows > 0 {
+            println!(
+                "{}: {} rows (across 16 shards)",
+                "content".cyan(),
+                total_content_rows.to_string().yellow()
+            );
+        }
+
+        println!("\n{}", "Tips for compaction and cleanup:".bold().cyan());
+        println!("• Run 'compact_db' periodically after large data imports");
+        println!(
+            "• Current implementation uses optimize() + checkout_latest() + handle management"
+        );
+        println!("• If database keeps growing, the LanceDB version may not expose cleanup_old_versions()");
+        println!("• Manual cleanup may require external tools or newer LanceDB versions");
+        println!("• Check LanceDB logs for actual cleanup statistics");
+
+        Ok(())
+    }
+
+    // clear_call_relationships removed - calls table no longer exists
+
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Centralized git file hash resolution for all stores
+    /// Resolves file paths to git blob hashes at a specific commit using gitoxide
+    pub async fn resolve_git_file_hashes(
+        &self,
+        file_paths: &[String],
+        git_sha: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        match crate::git::resolve_files_at_commit(&self.git_repo_path, git_sha, file_paths) {
+            Ok(resolved_hashes) => {
+                // If no files were resolved, log this as a warning
+                if resolved_hashes.is_empty() {
+                    tracing::warn!(
+                        "No files were resolved at commit {} in repository {}",
+                        git_sha,
+                        self.git_repo_path
+                    );
+                }
+
+                Ok(resolved_hashes)
+            }
+            Err(e) => {
+                tracing::error!("DatabaseManager::resolve_git_file_hashes: Failed to resolve git files at commit {}: {}", git_sha, e);
+                tracing::error!("Repository path: {}", self.git_repo_path);
+                tracing::error!("Requested file paths: {:?}", file_paths);
+                Ok(std::collections::HashMap::new()) // Return empty map instead of failing, let caller handle
+            }
+        }
+    }
+
+    // Processed files operations
+
+    /// Record that a file has been processed with the given git SHA and file content hash
+    pub async fn mark_file_processed(
+        &self,
+        file: String,
+        git_sha: Option<String>,
+        git_file_sha: String,
+    ) -> Result<()> {
+        let record = ProcessedFileRecord {
+            file,
+            git_sha,
+            git_file_sha,
+        };
+        self.processed_file_store.insert(record).await
+    }
+
+    /// Record multiple processed files
+    pub async fn mark_files_processed(&self, records: Vec<ProcessedFileRecord>) -> Result<()> {
+        self.processed_file_store.insert_batch(records).await
+    }
+
+    /// Check if a file has been processed with the given git SHA and file content hash
+    pub async fn is_file_processed(&self, git_file_sha: &str) -> Result<bool> {
+        self.processed_file_store.is_processed(git_file_sha).await
+    }
+
+    /// Get all processed files for a specific git SHA
+    pub async fn get_processed_files_for_git_sha(
+        &self,
+        git_sha: Option<&str>,
+    ) -> Result<Vec<ProcessedFileRecord>> {
+        self.processed_file_store
+            .get_processed_files_for_git_sha(git_sha)
+            .await
+    }
+
+    /// Remove processed file records for a specific git SHA (useful when git head changes)
+    pub async fn clear_processed_files_for_git_sha(&self, git_sha: Option<&str>) -> Result<()> {
+        self.processed_file_store.remove_for_git_sha(git_sha).await
+    }
+
+    /// Remove a specific processed file record
+    pub async fn unmark_file_processed(
+        &self,
+        file: &str,
+        git_sha: Option<&str>,
+        git_file_sha: &str,
+    ) -> Result<()> {
+        self.processed_file_store
+            .remove_file(file, git_sha, git_file_sha)
+            .await
+    }
+
+    /// Get total count of processed files
+    pub async fn get_processed_files_count(&self) -> Result<usize> {
+        self.processed_file_store.count().await
+    }
+
+    /// Get all processed file records
+    pub async fn get_all_processed_files(&self) -> Result<Vec<ProcessedFileRecord>> {
+        self.processed_file_store.get_all().await
+    }
+
+    /// Get all symbol-filename pairs
+    pub async fn get_all_symbol_filename_pairs(&self) -> Result<Vec<(String, String)>> {
+        self.symbol_filename_store.get_all().await
+    }
+
+    /// Get all existing git file SHAs from processed files for deduplication (optimized streaming version)
+    pub async fn get_existing_git_file_shas(&self) -> Result<std::collections::HashSet<String>> {
+        // Use the optimized method that only loads git_file_sha column
+        self.processed_file_store.get_all_git_file_shas().await
+    }
+
+    /// Get file/git_file_sha pairs for pipeline deduplication (optimized for large datasets)
+    pub async fn get_processed_file_pairs(
+        &self,
+    ) -> Result<std::collections::HashSet<(String, String)>> {
+        // Use the optimized method that only loads the two needed columns
+        self.processed_file_store.get_all_file_git_sha_pairs().await
+    }
+
+    // ==================== Branch Management ====================
+
+    /// Record that a branch has been indexed at a specific commit
+    pub async fn record_branch_indexed(
+        &self,
+        branch_name: &str,
+        tip_commit: &str,
+        remote: Option<&str>,
+    ) -> Result<()> {
+        use crate::database::branches::IndexedBranchInfo;
+        let info = IndexedBranchInfo {
+            branch_name: branch_name.to_string(),
+            tip_commit: tip_commit.to_string(),
+            indexed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            remote: remote.map(|s| s.to_string()),
+        };
+        self.branch_store.record_branch_indexed(&info).await
+    }
+
+    /// Get the tip commit for a specific branch
+    pub async fn get_branch_tip(&self, branch_name: &str) -> Result<Option<String>> {
+        self.branch_store.get_branch_tip(branch_name).await
+    }
+
+    /// Get full information about a specific indexed branch
+    pub async fn get_indexed_branch_info(
+        &self,
+        branch_name: &str,
+    ) -> Result<Option<crate::database::branches::IndexedBranchInfo>> {
+        self.branch_store.get_branch_info(branch_name).await
+    }
+
+    /// List all indexed branches
+    pub async fn list_indexed_branches(
+        &self,
+    ) -> Result<Vec<crate::database::branches::IndexedBranchInfo>> {
+        self.branch_store.list_indexed_branches().await
+    }
+
+    /// Check if a branch is indexed at the current tip commit
+    pub async fn is_branch_current(&self, branch_name: &str, current_tip: &str) -> Result<bool> {
+        self.branch_store
+            .is_branch_current(branch_name, current_tip)
+            .await
+    }
+
+    /// Remove a branch record (used when branch is deleted)
+    pub async fn remove_indexed_branch(&self, branch_name: &str) -> Result<()> {
+        self.branch_store.remove_branch(branch_name).await
+    }
+
+    /// Remove all branches for a specific remote
+    pub async fn remove_branches_by_remote(&self, remote: &str) -> Result<usize> {
+        self.branch_store.remove_branches_by_remote(remote).await
+    }
+
+    /// Get all branches that point to a specific commit
+    pub async fn get_branches_at_commit(
+        &self,
+        commit_sha: &str,
+    ) -> Result<Vec<crate::database::branches::IndexedBranchInfo>> {
+        self.branch_store.get_branches_at_commit(commit_sha).await
+    }
+
+    /// Get count of indexed branches
+    pub async fn get_indexed_branch_count(&self) -> Result<usize> {
+        self.branch_store.count().await
+    }
+
+    // ==================== End Branch Management ====================
+
+    pub async fn get_existing_function_names(&self) -> Result<std::collections::HashSet<String>> {
+        use futures::TryStreamExt;
+
+        let table = self.connection.open_table("functions").execute().await?;
+        let results = table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut function_names = std::collections::HashSet::new();
+
+        for batch in results {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let name_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                let function_name = name_array.value(i);
+                function_names.insert(function_name.to_string());
+            }
+        }
+
+        tracing::debug!(
+            "Loaded {} existing function names for call relationship filtering",
+            function_names.len()
+        );
+        Ok(function_names)
+    }
+
+    // Incremental scan support methods
+
+    /// Determine which files need to be rescanned for incremental updates
+    /// Given commitA and commitB, finds all files that should be processed
+    pub async fn get_files_for_incremental_scan(
+        &self,
+        commit_a: &str,
+        commit_b: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        use crate::git::{get_changed_files, ChangeType};
+
+        tracing::info!(
+            "Calculating files for incremental scan from {} to {}",
+            commit_a,
+            commit_b
+        );
+
+        // Step 1: Get directly changed files between commits
+        let changed_files = get_changed_files(&self.git_repo_path, commit_a, commit_b)?;
+        let mut files_to_scan = std::collections::HashSet::new();
+
+        // Add all directly changed files (except deleted ones)
+        for changed_file in &changed_files {
+            if changed_file.change_type != ChangeType::Deleted {
+                files_to_scan.insert(changed_file.path.clone());
+            }
+        }
+
+        tracing::info!("Found {} directly changed files", files_to_scan.len());
+
+        // Step 2: Find files connected via relationship tables
+        let connected_files = self.find_files_connected_to_changes(&changed_files).await?;
+        files_to_scan.extend(connected_files);
+
+        tracing::info!("Total files for incremental scan: {}", files_to_scan.len());
+
+        Ok(files_to_scan)
+    }
+
+    /// Find files that are connected to changed files via call graphs and type relationships
+    async fn find_files_connected_to_changes(
+        &self,
+        changed_files: &[crate::git::ChangedFile],
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut connected_files = std::collections::HashSet::new();
+
+        // Collect all file paths that changed
+        let changed_file_paths: std::collections::HashSet<String> =
+            changed_files.iter().map(|cf| cf.path.clone()).collect();
+
+        tracing::debug!(
+            "Finding files connected to {} changed files",
+            changed_file_paths.len()
+        );
+        for (i, file) in changed_file_paths.iter().enumerate() {
+            tracing::debug!("  Changed file {}: {}", i + 1, file);
+        }
+
+        // Step 1: Find files connected via call relationships
+        let call_connected = self.find_files_connected_via_calls(changed_files).await?;
+        connected_files.extend(call_connected.iter().cloned());
+        tracing::debug!("Found {} files connected via calls", call_connected.len());
+
+        // Step 2 & 3: Function-type and type-type relationship tracking disabled
+        // (will be reimplemented using embedded calls/types columns)
+
+        // Remove files that are already in the changed files list
+        connected_files.retain(|f| !changed_file_paths.contains(f));
+
+        tracing::info!(
+            "Found {} additional files connected to changes",
+            connected_files.len()
+        );
+        if !connected_files.is_empty() {
+            tracing::info!("Connected files:");
+            for (i, file) in connected_files.iter().enumerate() {
+                tracing::info!("  Connected file {}: {}", i + 1, file);
+            }
+        }
+
+        Ok(connected_files)
+    }
+
+    /// Find files connected via call relationships (optimized with pre-loaded mappings)
+    /// If fileA changes, find all files that:
+    /// 1. Call functions in fileA (callers of changed functions)
+    /// 2. Contain functions called by fileA (callees of changed functions)
+    async fn find_files_connected_via_calls(
+        &self,
+        changed_files: &[crate::git::ChangedFile],
+    ) -> Result<std::collections::HashSet<String>> {
+        // TODO: Reimplement this method using embedded JSON calls columns instead of the old calls table
+        // The calls table no longer exists - call relationships are now embedded in function JSON columns
+        // This method should:
+        // 1. Read the calls JSON column from functions table
+        // 2. Parse the JSON arrays to find call relationships
+        // 3. Find files connected to changed files via these relationships
+
+        let _changed_file_paths: std::collections::HashSet<String> =
+            changed_files.iter().map(|cf| cf.path.clone()).collect();
+
+        tracing::debug!("Call connection analysis disabled - calls table removed, embedded JSON approach not yet implemented");
+        tracing::debug!(
+            "Returning empty set for {} changed files",
+            changed_files.len()
+        );
+
+        // Return empty set until reimplemented
+        Ok(std::collections::HashSet::new())
+    }
+
+    /// Search function bodies using regex patterns via LanceDB - searches sharded content tables
+    pub async fn grep_function_bodies(
+        &self,
+        pattern: &str,
+        path_pattern: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<FunctionInfo>, bool)> {
+        use futures::TryStreamExt;
+
+        // Step 1: Search all content shard tables for matching content
+        // Only escape single quotes for SQL string literal - preserve backslashes for regex
+        let escaped_pattern = pattern.replace("'", "''");
+
+        let where_clause = format!("regexp_like(content, '{escaped_pattern}')");
+
+        // Collect matching blake3 hashes from all content shards (content_0 through content_15)
+        let mut matching_hashes: Vec<String> = Vec::new();
+
+        // Query all 16 content shard tables
+        for shard in 0..16u8 {
+            let table_name = format!("content_{shard}");
+            let content_table = self.connection.open_table(&table_name).execute().await?;
+            let content_results = content_table
+                .query()
+                .only_if(&where_clause)
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            // Collect matching hashes from this shard
+            for batch in &content_results {
+                let blake3_hash_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    matching_hashes.push(blake3_hash_array.value(i).to_string());
+                }
+            }
+        }
+
+        if matching_hashes.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+
+        // Step 2: Find functions that have these body hashes
+        let functions_table = self.connection.open_table("functions").execute().await?;
+        let mut matching_functions = Vec::new();
+        let mut limit_hit = false;
+
+        // Optimize batch processing based on hash count
+        let hash_count = matching_hashes.len();
+        let function_lookup_start = std::time::Instant::now();
+
+        // Determine processing strategy based on hash count and available parallelism
+        let available_cores = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+        let parallel_threshold = if available_cores >= 8 { 1000 } else { 2000 };
+
+        if hash_count <= parallel_threshold {
+            // For smaller result sets, use a single query for optimal performance
+            tracing::debug!(
+                "Using optimized single query for {} hashes (threshold: {})",
+                hash_count,
+                parallel_threshold
+            );
+
+            let hash_list: Vec<String> = matching_hashes
+                .iter()
+                .map(|hash| format!("'{hash}'"))
+                .collect();
+
+            let in_clause = hash_list.join(", ");
+            let filter = format!("body_hash IN ({in_clause})");
+
+            let function_results = functions_table
+                .query()
+                .only_if(filter)
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            let functions = self
+                .function_store
+                .extract_functions_from_batches(&function_results)
+                .await?;
+            for func in functions {
+                if path_pattern.is_none() && limit > 0 && matching_functions.len() >= limit {
+                    limit_hit = true;
+                    break;
+                }
+                matching_functions.push(func);
+            }
+        } else {
+            // For larger result sets, use batched queries optimized for parallel processing
+            let chunk_size = 500; // Balanced size for parallel processing with 16 CPUs
+
+            // Process chunks concurrently for better performance
+            use futures::stream::{self, StreamExt};
+
+            let chunks: Vec<_> = matching_hashes.chunks(chunk_size).collect();
+            // Use up to 16 CPUs, but adapt based on available cores and chunk count
+            let max_concurrency = std::cmp::min(
+                16,
+                std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(4),
+            );
+            let concurrent_limit = std::cmp::min(max_concurrency, chunks.len());
+
+            tracing::debug!("Using parallel batched queries: {} chunks of {} hashes each, {} concurrent workers ({} CPU cores available)",
+                chunks.len(), chunk_size, concurrent_limit,
+                std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1));
+
+            // Collect all function batches from every chunk, then do a single bulk
+            // content fetch across all chunks to avoid repeated table opens.
+            let mut all_function_batches: Vec<RecordBatch> = Vec::new();
+
+            let mut chunk_stream = stream::iter(chunks)
+                .map(|chunk| {
+                    let functions_table = &functions_table;
+                    async move {
+                        let hash_list: Vec<String> =
+                            chunk.iter().map(|hash| format!("'{hash}'")).collect();
+
+                        let in_clause = hash_list.join(", ");
+                        let filter = format!("body_hash IN ({in_clause})");
+
+                        let function_results = functions_table
+                            .query()
+                            .only_if(filter)
+                            .execute()
+                            .await?
+                            .try_collect::<Vec<_>>()
+                            .await?;
+
+                        Ok::<Vec<RecordBatch>, anyhow::Error>(function_results)
+                    }
+                })
+                .buffer_unordered(concurrent_limit);
+
+            while let Some(chunk_result) = chunk_stream.next().await {
+                all_function_batches.extend(chunk_result?);
+            }
+
+            let functions = self
+                .function_store
+                .extract_functions_from_batches(&all_function_batches)
+                .await?;
+
+            // Collect results, applying the limit
+            for func in functions {
+                if path_pattern.is_none() && limit > 0 && matching_functions.len() >= limit {
+                    limit_hit = true;
+                    break;
+                }
+                matching_functions.push(func);
+            }
+        }
+
+        let function_lookup_duration = function_lookup_start.elapsed();
+        tracing::debug!(
+            "Function body grep: pattern '{}' matched {} content entries, {} functions in {:?}{}",
+            pattern,
+            matching_hashes.len(),
+            matching_functions.len(),
+            function_lookup_duration,
+            if path_pattern.is_some() {
+                " (no limit applied yet - will limit after path filtering)"
+            } else {
+                ""
+            }
+        );
+
+        // Filter by path pattern if provided
+        let (final_functions, final_limit_hit) = if let Some(path_regex) = path_pattern {
+            match regex::RegexBuilder::new(path_regex)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(path_re) => {
+                    let original_count = matching_functions.len();
+                    let mut filtered = Vec::new();
+                    let mut path_limit_hit = false;
+
+                    // Apply path filter while respecting limit (0 = unlimited)
+                    for func in matching_functions {
+                        if path_re.is_match(&func.file_path) {
+                            if limit > 0 && filtered.len() >= limit {
+                                path_limit_hit = true;
+                                break;
+                            }
+                            filtered.push(func);
+                        }
+                    }
+
+                    tracing::debug!(
+                        "Path filter '{}' reduced results from {} to {} functions",
+                        path_regex,
+                        original_count,
+                        filtered.len()
+                    );
+
+                    // When path filtering is used, limit applies to filtered results only
+                    (filtered, path_limit_hit)
+                }
+                Err(e) => {
+                    tracing::error!("Invalid path regex '{}': {}", path_regex, e);
+                    return Err(anyhow::anyhow!(
+                        "Invalid path regex '{}': {}",
+                        path_regex,
+                        e
+                    ));
+                }
+            }
+        } else {
+            (matching_functions, limit_hit)
+        };
+
+        Ok((final_functions, final_limit_hit))
+    }
+
+    /// Git-aware search function bodies using regex patterns via LanceDB - searches sharded content tables
+    /// Filters results to only include functions that exist at the specified git commit
+    pub async fn grep_function_bodies_git_aware(
+        &self,
+        pattern: &str,
+        path_pattern: Option<&str>,
+        limit: usize,
+        git_sha: &str,
+    ) -> Result<(Vec<FunctionInfo>, bool)> {
+        // Get workdir overlay matches first
+        let workdir_matches = self.workdir_grep_functions(pattern, path_pattern);
+        let workdir_files: HashSet<String> = workdir_matches
+            .iter()
+            .map(|f| f.file_path.clone())
+            .collect();
+
+        // Step 1: Get all matching functions using the existing non-git-aware method
+        let (all_matching_functions, limit_hit_pre_filter) =
+            self.grep_function_bodies(pattern, path_pattern, 0).await?; // Use 0 for unlimited to get all matches first
+
+        if all_matching_functions.is_empty() && workdir_matches.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+
+        // Step 2: Extract unique file paths from matching functions
+        let unique_file_paths: Vec<String> = all_matching_functions
+            .iter()
+            .map(|f| f.file_path.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        tracing::debug!(
+            "grep_function_bodies_git_aware: Found {} matching functions in {} unique files, filtering by git SHA {}",
+            all_matching_functions.len(),
+            unique_file_paths.len(),
+            git_sha
+        );
+
+        // Step 3: Resolve file paths to git hashes at target commit
+        let resolved_hashes = self
+            .resolve_git_file_hashes(&unique_file_paths, git_sha)
+            .await?;
+        if resolved_hashes.is_empty() {
+            tracing::warn!(
+                "No files resolved for grep pattern '{}' at commit '{}'",
+                pattern,
+                git_sha
+            );
+            return Ok((Vec::new(), false));
+        }
+
+        // Step 4: Filter functions to only those that exist in the git manifest
+        let mut git_filtered_functions = Vec::new();
+        let mut limit_hit = false;
+        let total_matching_functions = all_matching_functions.len();
+
+        for func in &all_matching_functions {
+            // Check if this function's file SHA matches the git manifest
+            if let Some(expected_hash) = resolved_hashes.get(&func.file_path) {
+                if &func.git_file_hash == expected_hash {
+                    if limit > 0 && git_filtered_functions.len() >= limit {
+                        limit_hit = true;
+                        break;
+                    }
+                    tracing::debug!(
+                        "Including function: {} in {} (hash: {})",
+                        func.name,
+                        func.file_path,
+                        func.git_file_hash
+                    );
+                    git_filtered_functions.push(func.clone());
+                } else {
+                    tracing::debug!(
+                        "Filtered out function: {} in {} (hash mismatch: {} vs {})",
+                        func.name,
+                        func.file_path,
+                        func.git_file_hash,
+                        expected_hash
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    "Filtered out function: {} in {} (file not found in git manifest)",
+                    func.name,
+                    func.file_path
+                );
+            }
+        }
+
+        // Merge workdir results with DB results, excluding dirty/deleted files from DB
+        let mut merged = workdir_matches;
+        for func in git_filtered_functions {
+            if !workdir_files.contains(&func.file_path) && !self.workdir_is_deleted(&func.file_path)
+            {
+                merged.push(func);
+            }
+        }
+
+        let mut final_limit_hit = limit_hit || limit_hit_pre_filter;
+        if limit > 0 && merged.len() > limit {
+            merged.truncate(limit);
+            final_limit_hit = true;
+        }
+
+        tracing::info!(
+            "Git-aware grep: pattern '{}' matched {} DB functions + {} workdir, filtered to {} at git commit {}",
+            pattern,
+            total_matching_functions,
+            workdir_files.len(),
+            merged.len(),
+            git_sha
+        );
+
+        Ok((merged, final_limit_hit))
+    }
+
+    /// Efficient callers function implementation following the 4-step algorithm:
+    /// 1. Identify git commit SHA (passed as argument or default to current commit)
+    /// 2. Generate manifest of all file SHAs in that git commit
+    /// 3. Find functions that call the target function using efficient LanceDB query
+    /// 4. Report the results
+    pub async fn find_callers_efficient(
+        &self,
+        target_function: &str,
+        git_sha: Option<&str>,
+    ) -> Result<Vec<FunctionInfo>> {
+        let total_start = std::time::Instant::now();
+        tracing::info!(
+            "Starting efficient callers search for function: {}",
+            target_function
+        );
+
+        // Step 1: Identify git commit SHA
+        let step1_start = std::time::Instant::now();
+        let effective_git_sha = match git_sha {
+            Some(sha) => {
+                tracing::info!("Using provided git commit SHA: {}", sha);
+                sha.to_string()
+            }
+            None => {
+                // Default to current commit
+                match crate::git::get_git_sha(&self.git_repo_path) {
+                    Ok(Some(current_sha)) => {
+                        tracing::info!("Using current git commit SHA: {}", current_sha);
+                        current_sha
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "Not in a git repository, falling back to non-git-aware search"
+                        );
+                        return self.find_callers_non_git_aware(target_function).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to get current git SHA: {}, falling back to non-git-aware search", e);
+                        return self.find_callers_non_git_aware(target_function).await;
+                    }
+                }
+            }
+        };
+        tracing::info!(
+            "find_callers_efficient: Step 1 (identify git SHA) took {:?}",
+            step1_start.elapsed()
+        );
+
+        // Step 2: Generate manifest of all file SHAs in that git commit
+        let step2_start = std::time::Instant::now();
+        tracing::info!(
+            "Generating complete git file manifest for commit: {}",
+            effective_git_sha
+        );
+        let git_manifest = self.generate_git_manifest(&effective_git_sha).await?;
+        tracing::info!(
+            "Generated manifest with {} files at commit {}",
+            git_manifest.len(),
+            effective_git_sha
+        );
+        tracing::info!(
+            "find_callers_efficient: Step 2 (generate git manifest) took {:?}",
+            step2_start.elapsed()
+        );
+
+        if git_manifest.is_empty() {
+            tracing::warn!("No files found in git commit {}", effective_git_sha);
+            return Ok(Vec::new());
+        }
+
+        // Step 3: Find functions that call the target function using efficient LanceDB query
+        let step3_start = std::time::Instant::now();
+        tracing::info!("Searching for functions that call: {}", target_function);
+
+        // Use the new embedded JSON schema to find all potential callers
+        let all_callers = self.get_function_callers(target_function).await?;
+        if all_callers.is_empty() {
+            tracing::info!("No functions call '{}' in database", target_function);
+            return Ok(Vec::new());
+        }
+
+        tracing::info!(
+            "Found {} potential callers, filtering against {} files in git manifest",
+            all_callers.len(),
+            git_manifest.len()
+        );
+
+        // Get function details for all callers
+        let caller_functions = self.function_store.get_by_names(&all_callers).await?;
+        if caller_functions.is_empty() {
+            tracing::warn!("No caller function details found");
+            return Ok(Vec::new());
+        }
+        tracing::info!("find_callers_efficient: Step 3 (find potential callers) took {:?}, found {} potential callers",
+            step3_start.elapsed(), all_callers.len());
+
+        // Step 4: Filter callers to only those that exist in the git manifest and report results
+        let step4_start = std::time::Instant::now();
+        let mut valid_callers = Vec::new();
+
+        for caller_name in &all_callers {
+            if let Some(func) = caller_functions.get(caller_name) {
+                // Check if this function's file SHA matches the git manifest
+                if let Some(expected_hash) = git_manifest.get(&func.file_path) {
+                    if &func.git_file_hash == expected_hash {
+                        valid_callers.push(func.clone());
+                        tracing::debug!(
+                            "Valid caller: {} in {} (hash: {})",
+                            func.name,
+                            func.file_path,
+                            func.git_file_hash
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Filtered out caller: {} in {} (hash mismatch: {} vs {})",
+                            func.name,
+                            func.file_path,
+                            func.git_file_hash,
+                            expected_hash
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        "Filtered out caller: {} in {} (file not found in git manifest)",
+                        func.name,
+                        func.file_path
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            "find_callers_efficient: Step 4 (filter callers against manifest) took {:?}",
+            step4_start.elapsed()
+        );
+
+        tracing::info!(
+            "Found {} valid callers for '{}' at git commit {}",
+            valid_callers.len(),
+            target_function,
+            effective_git_sha
+        );
+
+        tracing::info!(
+            "find_callers_efficient: TOTAL time {:?}, found {} valid callers",
+            total_start.elapsed(),
+            valid_callers.len()
+        );
+        Ok(valid_callers)
+    }
+
+    /// Get callers using pre-loaded git manifest for filtering
+    /// Generate a complete manifest of all file paths and their SHAs at a specific git commit
+    /// Uses the shared git tree traversal utility for consistency
+    pub async fn generate_git_manifest(
+        &self,
+        git_sha: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut manifest = std::collections::HashMap::new();
+
+        // Use shared tree traversal utility
+        crate::git::walk_tree_at_commit(
+            &self.git_repo_path,
+            git_sha,
+            |relative_path, object_id| {
+                // Normalize path by removing any double slashes
+                let normalized_path = relative_path.replace("//", "/");
+                manifest.insert(normalized_path, object_id.to_string());
+                Ok(())
+            },
+        )?;
+
+        // Merge with workdir overlay (adds dirty files, removes deleted files)
+        Ok(self.workdir_merged_manifest(manifest))
+    }
+
+    /// Fallback callers search when not in git repository
+    async fn find_callers_non_git_aware(&self, target_function: &str) -> Result<Vec<FunctionInfo>> {
+        tracing::info!(
+            "Performing non-git-aware callers search for: {}",
+            target_function
+        );
+
+        let all_callers = self.get_function_callers(target_function).await?;
+        if all_callers.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let caller_functions = self.function_store.get_by_names(&all_callers).await?;
+        let callers_vec: Vec<FunctionInfo> = caller_functions.into_values().collect();
+
+        tracing::info!(
+            "Found {} callers for '{}' (non-git-aware)",
+            callers_vec.len(),
+            target_function
+        );
+        Ok(callers_vec)
+    }
+
+    // Content operations for deduplication
+
+    /// Store content and return the blake3 hash
+    pub async fn store_content(&self, content: &str) -> Result<String> {
+        self.content_store.store_content(content).await
+    }
+
+    /// Store content and return hex hash
+    pub async fn store_content_with_hex_hash(&self, content: &str) -> Result<String> {
+        self.content_store
+            .store_content_with_hex_hash(content)
+            .await
+    }
+
+    /// Get content by blake3 hash
+    pub async fn get_content(&self, blake3_hash: &str) -> Result<Option<String>> {
+        self.content_store.get_content(blake3_hash).await
+    }
+
+    /// Get content by blake3 hash hex string
+    pub async fn get_content_by_hex(&self, blake3_hash_hex: &str) -> Result<Option<String>> {
+        self.content_store.get_content_by_hex(blake3_hash_hex).await
+    }
+
+    /// Bulk fetch content for multiple hashes - optimized for dump operations
+    pub async fn get_content_bulk(
+        &self,
+        hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        self.content_store.get_content_bulk(hashes).await
+    }
+
+    /// Check if content exists by hash
+    pub async fn content_exists(&self, blake3_hash: &str) -> Result<bool> {
+        self.content_store.content_exists(blake3_hash).await
+    }
+
+    /// Insert a batch of content items
+    pub async fn insert_content_batch(&self, content_items: Vec<ContentInfo>) -> Result<()> {
+        self.content_store.insert_batch(content_items).await
+    }
+
+    /// Get all content (for debugging/analysis)
+    pub async fn get_all_content(&self) -> Result<Vec<ContentInfo>> {
+        self.content_store.get_all().await
+    }
+
+    /// Get statistics about content storage
+    pub async fn get_content_stats(&self) -> Result<crate::database::content::ContentStats> {
+        self.content_store.get_stats().await
+    }
+
+    // ============================================================================
+    // Git Manifest-based optimization methods for bulk operations
+    // ============================================================================
+
+    /// Check if a function exists at git commit using pre-generated manifest (fast)
+    async fn function_exists_in_manifest(
+        &self,
+        function_name: &str,
+        git_manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<bool> {
+        // Get all functions with this name (non-git-aware, fast database query)
+        let all_functions = self
+            .function_store
+            .find_all_by_name_unfiltered(function_name)
+            .await?;
+
+        // Check if any function exists in the git manifest (fast HashMap lookup)
+        for func in &all_functions {
+            if let Some(expected_hash) = git_manifest.get(&func.file_path) {
+                if &func.git_file_hash == expected_hash {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Get function callees using pre-generated manifest (fast)
+    pub async fn get_function_callees_with_manifest(
+        &self,
+        function_name: &str,
+        git_manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>> {
+        // Query functions table directly - efficient, doesn't fetch bodies
+        let escaped_name = function_name.replace("'", "''");
+        let table = self.connection.open_table("functions").execute().await?;
+
+        let results = table
+            .query()
+            .only_if(format!("name = '{escaped_name}'"))
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Filter by git hash and collect matching functions
+        let mut matches = Vec::new();
+
+        for batch in results {
+            if batch.num_rows() > 0 {
+                let file_path_array = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let git_file_hash_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let line_start_array = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+                let line_end_array = batch
+                    .column(4)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+
+                // Find the calls column
+                let calls_column_idx = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "calls")
+                    .ok_or_else(|| anyhow::anyhow!("calls column not found in functions table"))?;
+                let calls_array = batch
+                    .column(calls_column_idx)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let file_path = file_path_array.value(i);
+                    let git_file_hash = git_file_hash_array.value(i);
+
+                    // Fast manifest lookup
+                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                        if git_file_hash == expected_hash {
+                            // Parse the calls JSON
+                            let calls = if calls_array.is_null(i) {
+                                None
+                            } else {
+                                serde_json::from_str::<Vec<String>>(calls_array.value(i)).ok()
+                            };
+
+                            // Collect lightweight info for selection
+                            matches.push((
+                                file_path.to_string(),
+                                line_start_array.value(i) as u32,
+                                line_end_array.value(i) as u32,
+                                calls,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Select best match (prefer implementation over declaration)
+        let best_match = matches
+            .into_iter()
+            .max_by_key(|(file_path, line_start, line_end, _)| {
+                let line_count = line_end.saturating_sub(*line_start);
+                let is_header = file_path.ends_with(".h");
+                (if is_header { 0 } else { 1 }, line_count)
+            });
+
+        match best_match {
+            Some((_, _, _, Some(calls))) => Ok(calls),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Build a complete caller index from the database in ONE scan.
+    /// Returns HashMap<callee_name, Vec<caller_name>> filtered by git manifest.
+    /// This is much faster than doing N separate LIKE queries for N functions.
+    pub async fn build_caller_index_with_manifest(
+        &self,
+        git_manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let start = std::time::Instant::now();
+        let table = self.connection.open_table("functions").execute().await?;
+
+        // Query all functions that have calls (one scan)
+        let results = table
+            .query()
+            .only_if("calls IS NOT NULL")
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut caller_index: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+
+        for batch in results {
+            if batch.num_rows() > 0 {
+                let name_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let file_path_array = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let git_file_hash_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                let calls_column_idx = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "calls")
+                    .ok_or_else(|| anyhow::anyhow!("calls column not found"))?;
+                let calls_array = batch
+                    .column(calls_column_idx)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let file_path = file_path_array.value(i);
+                    let git_file_hash = git_file_hash_array.value(i);
+
+                    // Only include functions that exist at the current git commit
+                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                        if git_file_hash == expected_hash {
+                            let caller_name = name_array.value(i);
+                            if !calls_array.is_null(i) {
+                                if let Ok(calls_list) =
+                                    serde_json::from_str::<Vec<String>>(calls_array.value(i))
+                                {
+                                    for callee in calls_list {
+                                        caller_index
+                                            .entry(callee)
+                                            .or_default()
+                                            .push(caller_name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "build_caller_index_with_manifest: built index with {} callees in {:?}",
+            caller_index.len(),
+            start.elapsed()
+        );
+        Ok(caller_index)
+    }
+
+    /// Get function callers using pre-generated manifest (fast)
+    pub async fn get_function_callers_with_manifest(
+        &self,
+        function_name: &str,
+        git_manifest: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>> {
+        // Use efficient filtering: find functions whose calls JSON contains the target function name
+        let escaped_name = function_name.replace("'", "''"); // SQL escape
+        let table = self.connection.open_table("functions").execute().await?;
+
+        // Filter for functions whose calls column contains the target function name
+        let filter = format!("calls IS NOT NULL AND calls LIKE '%\\\"{escaped_name}\\\"%%'");
+        let results = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut callers = Vec::new();
+
+        for batch in results {
+            if batch.num_rows() > 0 {
+                let name_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let file_path_array = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let git_file_hash_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                // Find the calls column
+                let calls_column_idx = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|f| f.name() == "calls")
+                    .ok_or_else(|| anyhow::anyhow!("calls column not found in functions table"))?;
+                let calls_array = batch
+                    .column(calls_column_idx)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+
+                for i in 0..batch.num_rows() {
+                    let caller_name = name_array.value(i);
+                    let file_path = file_path_array.value(i);
+                    let git_file_hash = git_file_hash_array.value(i).to_string();
+
+                    // Fast manifest lookup instead of expensive git resolution
+                    if let Some(expected_hash) = git_manifest.get(file_path) {
+                        if &git_file_hash == expected_hash {
+                            // This function exists at the git SHA, verify it actually calls our target
+                            if !calls_array.is_null(i) {
+                                let calls_json = calls_array.value(i);
+                                if let Ok(calls_list) =
+                                    serde_json::from_str::<Vec<String>>(calls_json)
+                                {
+                                    if calls_list.contains(&function_name.to_string()) {
+                                        callers.push(caller_name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(callers)
+    }
+
+    // Git commits operations
+
+    /// Insert git commit metadata
+    pub async fn insert_git_commits(
+        &self,
+        commits: Vec<crate::types::GitCommitInfo>,
+    ) -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        if commits.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "insert_git_commits: Starting batch insertion of {} commits into git_commits table",
+            commits.len()
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_sha", DataType::Utf8, false),
+            Field::new("parent_sha", DataType::Utf8, false),
+            Field::new("author", DataType::Utf8, false),
+            Field::new("subject", DataType::Utf8, false),
+            Field::new("message", DataType::Utf8, false),
+            Field::new("tags", DataType::Utf8, false),
+            Field::new("diff", DataType::Utf8, false),
+            Field::new("symbols", DataType::Utf8, false),
+            Field::new("files", DataType::Utf8, false),
+        ]));
+
+        tracing::info!(
+            "insert_git_commits: Converting {} commits to Arrow arrays (serializing JSON for tags/symbols)...",
+            commits.len()
+        );
+        let array_conversion_start = std::time::Instant::now();
+
+        let mut git_shas = Vec::new();
+        let mut parent_shas = Vec::new();
+        let mut authors = Vec::new();
+        let mut subjects = Vec::new();
+        let mut messages = Vec::new();
+        let mut tags = Vec::new();
+        let mut diffs = Vec::new();
+        let mut symbols = Vec::new();
+        let mut files = Vec::new();
+
+        for commit in commits {
+            git_shas.push(commit.git_sha);
+            parent_shas.push(serde_json::to_string(&commit.parent_sha)?);
+            authors.push(commit.author);
+            subjects.push(commit.subject);
+            messages.push(commit.message);
+            tags.push(serde_json::to_string(&commit.tags)?);
+            diffs.push(commit.diff);
+            symbols.push(serde_json::to_string(&commit.symbols)?);
+            files.push(serde_json::to_string(&commit.files)?);
+        }
+
+        tracing::info!(
+            "insert_git_commits: Array conversion completed in {:.2}s",
+            array_conversion_start.elapsed().as_secs_f64()
+        );
+
+        tracing::info!(
+            "insert_git_commits: Creating Arrow RecordBatch with {} rows...",
+            git_shas.len()
+        );
+        let batch_creation_start = std::time::Instant::now();
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(git_shas)),
+            Arc::new(StringArray::from(parent_shas)),
+            Arc::new(StringArray::from(authors)),
+            Arc::new(StringArray::from(subjects)),
+            Arc::new(StringArray::from(messages)),
+            Arc::new(StringArray::from(tags)),
+            Arc::new(StringArray::from(diffs)),
+            Arc::new(StringArray::from(symbols)),
+            Arc::new(StringArray::from(files)),
+        ];
+
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+        let batches = vec![Ok(batch)];
+        let batch_iterator =
+            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema);
+
+        tracing::info!(
+            "insert_git_commits: RecordBatch creation completed in {:.2}s",
+            batch_creation_start.elapsed().as_secs_f64()
+        );
+
+        tracing::info!("insert_git_commits: Opening git_commits table...");
+        let table_open_start = std::time::Instant::now();
+        let table = self.connection.open_table("git_commits").execute().await?;
+        tracing::info!(
+            "insert_git_commits: Table opened in {:.2}s",
+            table_open_start.elapsed().as_secs_f64()
+        );
+
+        // Use merge_insert for upsert functionality (update if exists, insert if not)
+        tracing::info!(
+            "insert_git_commits: Executing merge_insert upsert operation (this may take several seconds)..."
+        );
+        let merge_insert_start = std::time::Instant::now();
+        let mut merge_insert = table.merge_insert(&["git_sha"]);
+        merge_insert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
+        tracing::info!(
+            "insert_git_commits: Merge_insert completed in {:.2}s",
+            merge_insert_start.elapsed().as_secs_f64()
+        );
+
+        tracing::info!("insert_git_commits: Batch insertion complete");
+
+        Ok(())
+    }
+
+    /// Insert lore emails into the database, returning the indices of
+    /// any emails that could not be stored.  Callers must not record
+    /// commit SHAs for failed indices in the lore_indexed_commits
+    /// table, otherwise those emails are permanently lost.
+    pub async fn insert_lore_emails(
+        &self,
+        emails: &[crate::types::LoreEmailInfo],
+    ) -> Result<Vec<usize>> {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        if emails.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        tracing::info!(
+            "insert_lore_emails: Starting batch insertion of {} emails into lore table",
+            emails.len()
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("git_commit_sha", DataType::Utf8, false),
+            Field::new("from", DataType::Utf8, false),
+            Field::new("date", DataType::Utf8, false),
+            Field::new("date_timestamp", DataType::Int64, false),
+            Field::new("message_id", DataType::Utf8, false),
+            Field::new("in_reply_to", DataType::Utf8, true),
+            Field::new("subject", DataType::Utf8, false),
+            Field::new("references", DataType::Utf8, true),
+            Field::new("recipients", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("symbols", DataType::Utf8, false),
+        ]));
+
+        // Deduplicate by message_id within the batch.  A lore
+        // archive can contain the same email in multiple git commits;
+        // appending duplicates would create redundant rows.  Keep the
+        // last occurrence.
+        let mut seen = std::collections::HashMap::with_capacity(emails.len());
+        for (i, email) in emails.iter().enumerate() {
+            seen.insert(&email.message_id, i);
+        }
+        let mut dedup_indices: Vec<usize> = seen.into_values().collect();
+        dedup_indices.sort_unstable();
+
+        let dedup_count = emails.len() - dedup_indices.len();
+        if dedup_count > 0 {
+            tracing::info!(
+                "insert_lore_emails: Removed {} duplicate message_ids from batch of {}",
+                dedup_count,
+                emails.len()
+            );
+        }
+
+        let table = self.connection.open_table("lore").execute().await?;
+
+        let mut failed_indices: Vec<usize> = Vec::new();
+
+        // Filter out emails whose message_id already exists in the
+        // table.  Normally every email here is new because
+        // index_lore_archive skips already-indexed commits, but a
+        // partial failure on a previous run can leave rows in the
+        // table whose commit SHA was never recorded in
+        // lore_indexed_commits.  Filtering avoids duplicates without
+        // relying on merge_insert, which hits a spurious null-column
+        // error in lance-file 3.0.1.
+        let new_indices = Self::filter_existing_lore_ids(&table, emails, &dedup_indices).await?;
+
+        if new_indices.len() < dedup_indices.len() {
+            tracing::info!(
+                "insert_lore_emails: {} of {} already in table, inserting {}",
+                dedup_indices.len() - new_indices.len(),
+                dedup_indices.len(),
+                new_indices.len(),
+            );
+        }
+
+        if new_indices.is_empty() {
+            tracing::info!("insert_lore_emails: no new emails to insert");
+            return Ok(failed_indices);
+        }
+
+        // Use table.add() instead of merge_insert.  merge_insert in
+        // lance-file 3.0.1 introduces spurious nulls during its
+        // internal join/write phase, causing every insert to fail
+        // with "subject contained null values".  Plain append avoids
+        // the merge codepath entirely.  Duplicates are prevented by
+        // the filter_existing_lore_ids check above.
+        if let Err(e) = Self::add_lore_chunk(&table, emails, &new_indices, &schema).await {
+            tracing::warn!(
+                "insert_lore_emails: full batch of {} failed ({}), \
+                 falling back to chunked insertion",
+                new_indices.len(),
+                e
+            );
+
+            const MAX_CHUNK: usize = 128;
+
+            for chunk in new_indices.chunks(MAX_CHUNK) {
+                if let Err(e) = Self::add_lore_chunk(&table, emails, chunk, &schema).await {
+                    tracing::warn!(
+                        "insert_lore_emails: chunk of {} failed ({}), \
+                         retrying individually",
+                        chunk.len(),
+                        e
+                    );
+                    for &idx in chunk {
+                        if let Err(e2) = Self::add_lore_chunk(&table, emails, &[idx], &schema).await
+                        {
+                            tracing::warn!(
+                                "insert_lore_emails: skipping \
+                                 message_id={}: {}",
+                                emails[idx].message_id,
+                                e2
+                            );
+                            failed_indices.push(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !failed_indices.is_empty() {
+            tracing::warn!(
+                "insert_lore_emails: {} of {} emails failed to insert",
+                failed_indices.len(),
+                new_indices.len()
+            );
+        }
+
+        tracing::info!("insert_lore_emails: Batch insertion complete");
+
+        Ok(failed_indices)
+    }
+
+    /// Return the subset of `indices` whose message_id does not
+    /// already exist in the lore table.
+    async fn filter_existing_lore_ids(
+        table: &lancedb::Table,
+        emails: &[crate::types::LoreEmailInfo],
+        indices: &[usize],
+    ) -> Result<Vec<usize>> {
+        use futures::TryStreamExt as _;
+
+        // Build an IN-list predicate.  message_ids are already
+        // validated to be non-empty, but escape single quotes for
+        // the SQL literal.
+        let id_list: Vec<String> = indices
+            .iter()
+            .map(|&i| format!("'{}'", emails[i].message_id.replace('\'', "''")))
+            .collect();
+
+        let predicate = format!("message_id IN ({})", id_list.join(", "));
+
+        let stream = table
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "message_id".to_string()
+            ]))
+            .only_if(&predicate)
+            .execute()
+            .await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        let mut existing = std::collections::HashSet::new();
+        for batch in &batches {
+            if let Some(col) = batch.column_by_name("message_id") {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("message_id column must be StringArray");
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        existing.insert(arr.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(indices
+            .iter()
+            .copied()
+            .filter(|&i| !existing.contains(&emails[i].message_id))
+            .collect())
+    }
+
+    /// Build a [`RecordBatch`] from the given email indices and
+    /// append it to the lore table.
+    async fn add_lore_chunk(
+        table: &lancedb::Table,
+        emails: &[crate::types::LoreEmailInfo],
+        indices: &[usize],
+        schema: &std::sync::Arc<arrow::datatypes::Schema>,
+    ) -> Result<()> {
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        debug_assert!(indices.iter().all(|&i| i < emails.len()));
+
+        let mut git_commit_shas = Vec::with_capacity(indices.len());
+        let mut from_addrs = Vec::with_capacity(indices.len());
+        let mut dates = Vec::with_capacity(indices.len());
+        let mut date_timestamps = Vec::with_capacity(indices.len());
+        let mut message_ids = Vec::with_capacity(indices.len());
+        let mut in_reply_tos = Vec::with_capacity(indices.len());
+        let mut subjects = Vec::with_capacity(indices.len());
+        let mut references_list = Vec::with_capacity(indices.len());
+        let mut recipients_list = Vec::with_capacity(indices.len());
+        let mut bodies = Vec::with_capacity(indices.len());
+        let mut symbols_list = Vec::with_capacity(indices.len());
+
+        for &idx in indices {
+            let email = &emails[idx];
+            git_commit_shas.push(email.git_commit_sha.clone());
+            from_addrs.push(email.from.clone());
+            dates.push(email.date.clone());
+            date_timestamps.push(email.date_timestamp);
+            message_ids.push(email.message_id.clone());
+            in_reply_tos.push(email.in_reply_to.clone());
+            subjects.push(email.subject.clone());
+            references_list.push(email.references.clone());
+            recipients_list.push(email.recipients.clone());
+            bodies.push(email.body.clone());
+            symbols_list.push(serde_json::to_string(&email.symbols)?);
+        }
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(git_commit_shas)),
+            Arc::new(StringArray::from(from_addrs)),
+            Arc::new(StringArray::from(dates)),
+            Arc::new(Int64Array::from(date_timestamps)),
+            Arc::new(StringArray::from(message_ids)),
+            Arc::new(StringArray::from(in_reply_tos)),
+            Arc::new(StringArray::from(subjects)),
+            Arc::new(StringArray::from(references_list)),
+            Arc::new(StringArray::from(recipients_list)),
+            Arc::new(StringArray::from(bodies)),
+            Arc::new(StringArray::from(symbols_list)),
+        ];
+
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+        table.add(vec![batch]).execute().await?;
+        Ok(())
+    }
+
+    /// Parse an RFC 2822 date string into a Unix timestamp.
+    /// Returns 0 if parsing fails.
+    fn parse_date_to_timestamp(date_str: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc2822(date_str)
+            .map(|dt| dt.timestamp())
+            .unwrap_or(0)
+    }
+
+    /// Extract date_timestamp from a batch row, falling back to parsing the
+    /// date string for databases that predate the date_timestamp column.
+    fn get_date_timestamp(
+        date_timestamps: Option<&arrow::array::Int64Array>,
+        dates: &arrow::array::GenericStringArray<i32>,
+        row: usize,
+    ) -> i64 {
+        if let Some(ts) = date_timestamps {
+            ts.value(row)
+        } else {
+            Self::parse_date_to_timestamp(dates.value(row))
+        }
+    }
+
+    /// Get all lore emails from the database
+    pub async fn get_all_lore_emails(&self) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        let table = self.connection.open_table("lore").execute().await?;
+        let stream = table.query().execute().await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        let mut emails = Vec::new();
+
+        for batch in batches {
+            let num_rows = batch.num_rows();
+
+            // Extract columns
+            let git_commit_shas = batch
+                .column_by_name("git_commit_sha")
+                .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                .as_string::<i32>();
+            let from_addrs = batch
+                .column_by_name("from")
+                .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                .as_string::<i32>();
+            let dates = batch
+                .column_by_name("date")
+                .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                .as_string::<i32>();
+            let date_timestamps = batch
+                .column_by_name("date_timestamp")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+            let message_ids = batch
+                .column_by_name("message_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                .as_string::<i32>();
+            let in_reply_tos = batch
+                .column_by_name("in_reply_to")
+                .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                .as_string::<i32>();
+            let subjects = batch
+                .column_by_name("subject")
+                .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                .as_string::<i32>();
+            let references_list = batch
+                .column_by_name("references")
+                .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                .as_string::<i32>();
+            let recipients_list = batch
+                .column_by_name("recipients")
+                .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                .as_string::<i32>();
+            let bodies = batch
+                .column_by_name("body")
+                .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                .as_string::<i32>();
+            let symbols_list = batch
+                .column_by_name("symbols")
+                .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                .as_string::<i32>();
+
+            for i in 0..num_rows {
+                // Parse JSON symbols array
+                let symbols_json = symbols_list.value(i);
+                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+                let email = crate::types::LoreEmailInfo {
+                    git_commit_sha: git_commit_shas.value(i).to_string(),
+                    from: from_addrs.value(i).to_string(),
+                    date: dates.value(i).to_string(),
+                    date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                    message_id: message_ids.value(i).to_string(),
+                    in_reply_to: if in_reply_tos.is_null(i) {
+                        None
+                    } else {
+                        Some(in_reply_tos.value(i).to_string())
+                    },
+                    subject: subjects.value(i).to_string(),
+                    references: if references_list.is_null(i) {
+                        None
+                    } else {
+                        Some(references_list.value(i).to_string())
+                    },
+                    recipients: recipients_list.value(i).to_string(),
+                    body: bodies.value(i).to_string(),
+                    symbols,
+                };
+                emails.push(email);
+            }
+        }
+
+        Ok(emails)
+    }
+
+    /// Search lore emails using Full Text Search with regex post-filtering
+    pub async fn search_lore_emails(
+        &self,
+        field: &str,
+        pattern: &str,
+        limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        // Parse filter dates to Unix timestamps for database-level filtering
+        let since_timestamp = since_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.timestamp());
+        let until_timestamp = until_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.timestamp());
+
+        tracing::info!(
+            "lore search: field='{}' pattern='{}' since_timestamp={:?} until_timestamp={:?}",
+            field,
+            pattern,
+            since_timestamp,
+            until_timestamp
+        );
+
+        let table = self.connection.open_table("lore").execute().await?;
+
+        // Only use date_timestamp filter if the column exists in the table
+        let has_date_timestamp = table
+            .schema()
+            .await
+            .map(|s| s.field_with_name("date_timestamp").is_ok())
+            .unwrap_or(false);
+        let date_filter = if has_date_timestamp {
+            match (since_timestamp, until_timestamp) {
+                (Some(since), Some(until)) => Some(format!(
+                    "date_timestamp >= {} AND date_timestamp <= {}",
+                    since, until
+                )),
+                (Some(since), None) => Some(format!("date_timestamp >= {}", since)),
+                (None, Some(until)) => Some(format!("date_timestamp <= {}", until)),
+                (None, None) => None,
+            }
+        } else {
+            None
+        };
+
+        // FTS uses simple tokenizer - normalize pattern by stripping special chars
+        let fts_pattern = pattern
+            .split(|c: char| !c.is_alphanumeric() && c != ' ')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let regex = regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()?;
+        let mut emails = Vec::new();
+        let target_limit = if limit > 0 { limit } else { 10000 };
+
+        // Incremental search: start with reasonable limit, expand until matches stop increasing
+        let mut fts_limit = if limit > 0 { limit * 10 } else { 10000 };
+        let mut previous_count = 0;
+        let mut first_iteration = true;
+
+        loop {
+            // When the FTS pattern is empty (e.g. regex ".*" has no
+            // alphanumeric tokens), skip FTS and use a plain table
+            // scan so the regex post-filter still runs.
+            let batches: Vec<_> = if fts_pattern.is_empty() {
+                tracing::info!(
+                    "FTS pattern empty for field '{}', falling back to table scan",
+                    field
+                );
+                let mut query_builder = table.query();
+                if let Some(ref filter) = date_filter {
+                    query_builder = query_builder.only_if(filter);
+                }
+                query_builder
+                    .limit(fts_limit)
+                    .execute()
+                    .await?
+                    .try_collect()
+                    .await?
+            } else {
+                let fts_query =
+                    FullTextSearchQuery::new(fts_pattern.clone()).with_column(field.to_owned())?;
+
+                let mut query_builder = table.query().full_text_search(fts_query);
+
+                // Apply date filter at database level so limit applies to date-filtered results
+                if let Some(ref filter) = date_filter {
+                    query_builder = query_builder.only_if(filter);
+                }
+
+                query_builder
+                    .limit(fts_limit)
+                    .execute()
+                    .await?
+                    .try_collect()
+                    .await?
+            };
+
+            let fts_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+            tracing::info!(
+                "FTS returned {} candidates with limit {} for field '{}'",
+                fts_count,
+                fts_limit,
+                field
+            );
+
+            // Step 2: Post-filter with regex and build email objects
+            emails.clear(); // Reset for this iteration
+
+            for batch in batches {
+                let num_rows = batch.num_rows();
+
+                // Extract columns
+                let git_commit_shas = batch
+                    .column_by_name("git_commit_sha")
+                    .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                    .as_string::<i32>();
+                let from_addrs = batch
+                    .column_by_name("from")
+                    .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                    .as_string::<i32>();
+                let dates = batch
+                    .column_by_name("date")
+                    .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                    .as_string::<i32>();
+                let date_timestamps = batch
+                    .column_by_name("date_timestamp")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+                let message_ids = batch
+                    .column_by_name("message_id")
+                    .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                    .as_string::<i32>();
+                let in_reply_tos = batch
+                    .column_by_name("in_reply_to")
+                    .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                    .as_string::<i32>();
+                let subjects = batch
+                    .column_by_name("subject")
+                    .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                    .as_string::<i32>();
+                let references_list = batch
+                    .column_by_name("references")
+                    .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                    .as_string::<i32>();
+                let recipients_list = batch
+                    .column_by_name("recipients")
+                    .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                    .as_string::<i32>();
+                let bodies = batch
+                    .column_by_name("body")
+                    .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                    .as_string::<i32>();
+                let symbols_list = batch
+                    .column_by_name("symbols")
+                    .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                    .as_string::<i32>();
+
+                for i in 0..num_rows {
+                    // Get the field value for regex matching
+                    let field_value = match field {
+                        "from" => from_addrs.value(i),
+                        "subject" => subjects.value(i),
+                        "body" => bodies.value(i),
+                        "recipients" => recipients_list.value(i),
+                        "symbols" => symbols_list.value(i),
+                        _ => continue, // Skip if unknown field
+                    };
+
+                    // Apply regex filter (case-insensitive for better matching)
+                    if !regex.is_match(field_value) {
+                        continue;
+                    }
+
+                    // Check limit
+                    if limit > 0 && emails.len() >= limit {
+                        break;
+                    }
+
+                    // Parse JSON symbols array
+                    let symbols_json = symbols_list.value(i);
+                    let symbols: Vec<String> =
+                        serde_json::from_str(symbols_json).unwrap_or_default();
+
+                    let email = crate::types::LoreEmailInfo {
+                        git_commit_sha: git_commit_shas.value(i).to_string(),
+                        from: from_addrs.value(i).to_string(),
+                        date: dates.value(i).to_string(),
+                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                        message_id: message_ids.value(i).to_string(),
+                        in_reply_to: if in_reply_tos.is_null(i) {
+                            None
+                        } else {
+                            Some(in_reply_tos.value(i).to_string())
+                        },
+                        subject: subjects.value(i).to_string(),
+                        references: if references_list.is_null(i) {
+                            None
+                        } else {
+                            Some(references_list.value(i).to_string())
+                        },
+                        recipients: recipients_list.value(i).to_string(),
+                        body: bodies.value(i).to_string(),
+                        symbols,
+                    };
+                    emails.push(email);
+                }
+
+                if limit > 0 && emails.len() >= limit {
+                    break;
+                }
+            }
+
+            // Check stopping conditions
+            if emails.len() >= target_limit {
+                tracing::info!(
+                    "Found {} results (target: {}), stopping",
+                    emails.len(),
+                    target_limit
+                );
+                break;
+            }
+
+            // Stop if count didn't increase (no more matches available)
+            // Skip this check on the first iteration to allow at least one expansion
+            if !first_iteration && emails.len() == previous_count {
+                tracing::info!(
+                    "Found {} results, count stopped increasing at FTS limit {}",
+                    emails.len(),
+                    fts_limit
+                );
+                break;
+            }
+
+            first_iteration = false;
+
+            // Stop if we've searched a very large set
+            if fts_limit >= 1000000 {
+                tracing::info!(
+                    "Found {} results, reached max FTS limit of {}",
+                    emails.len(),
+                    fts_limit
+                );
+                break;
+            }
+
+            tracing::info!(
+                "Found {} results with FTS limit {}, trying larger limit",
+                emails.len(),
+                fts_limit
+            );
+
+            previous_count = emails.len();
+            fts_limit *= 5; // Exponential expansion
+        }
+
+        Ok(emails)
+    }
+
+    /// Helper function to query lore emails by multiple fields and return intersection
+    /// Uses regex alternation for OR within fields, intersection for AND across fields
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn query_lore_by_fields_intersection(
+        &self,
+        from_patterns: Option<&[String]>,
+        subject_patterns: Option<&[String]>,
+        body_patterns: Option<&[String]>,
+        recipients_patterns: Option<&[String]>,
+        search_limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
+    ) -> Result<std::collections::HashSet<String>> {
+        use std::collections::HashSet;
+
+        let lore_table = self.connection.open_table("lore").execute().await?;
+        let mut field_result_sets: Vec<HashSet<String>> = Vec::new();
+
+        // Parse date filters into DateTime for temporal comparison
+        // in query_field_impl (RFC 2822 string comparison is not
+        // meaningful for date ordering).
+        let since_dt = since_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let until_dt = until_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        // Helper function to query a field using FTS with regex and
+        // date post-filtering.  Selects the "date" column alongside
+        // the searched field so temporal filtering happens on the
+        // already-fetched FTS candidates without extra lookups.
+        async fn query_field_impl(
+            lore_table: &lancedb::Table,
+            field_name: String,
+            pattern: String,
+            search_limit: usize,
+            since: Option<chrono::DateTime<chrono::Utc>>,
+            until: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<HashSet<String>> {
+            // FTS uses simple tokenizer - normalize pattern by stripping special chars
+            let fts_pattern = pattern
+                .split(|c: char| !c.is_alphanumeric() && c != ' ')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            tracing::info!(
+                "FTS query on field '{}': original='{}' normalized='{}'",
+                field_name,
+                pattern,
+                fts_pattern
+            );
+
+            let effective_limit = if search_limit > 0 {
+                search_limit
+            } else {
+                100000
+            };
+
+            // When the FTS pattern is empty (e.g. regex ".*" has no
+            // alphanumeric tokens), skip FTS and fall back to a plain
+            // table scan so the regex post-filter still runs.
+            let results = if fts_pattern.is_empty() {
+                tracing::info!(
+                    "FTS pattern empty for field '{}', falling back to table scan",
+                    field_name
+                );
+                lore_table
+                    .query()
+                    .select(lancedb::query::Select::Columns(vec![
+                        "message_id".to_string(),
+                        field_name.clone(),
+                        "date".to_string(),
+                    ]))
+                    .limit(effective_limit)
+                    .execute()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+            } else {
+                let fts_query =
+                    FullTextSearchQuery::new(fts_pattern).with_column(field_name.clone())?;
+                lore_table
+                    .query()
+                    .full_text_search(fts_query)
+                    .select(lancedb::query::Select::Columns(vec![
+                        "message_id".to_string(),
+                        "_score".to_string(),
+                        field_name.clone(),
+                        "date".to_string(),
+                    ]))
+                    .limit(effective_limit)
+                    .execute()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+            };
+
+            // Post-filter with regex and date range in memory
+            let fts_result_count: usize = results.iter().map(|b| b.num_rows()).sum();
+            tracing::info!(
+                "FTS returned {} candidates for field '{}'",
+                fts_result_count,
+                field_name
+            );
+
+            let regex = regex::RegexBuilder::new(&pattern)
+                .case_insensitive(true)
+                .build()?;
+            let has_date_filter = since.is_some() || until.is_some();
+            let mut message_ids = HashSet::new();
+            let mut bad_dates: usize = 0;
+
+            for batch in &results {
+                let msg_array: &arrow::array::StringArray = super::get_column(batch, "message_id")?;
+                let field_array: &arrow::array::StringArray =
+                    super::get_column(batch, &field_name)?;
+                let date_array: &arrow::array::StringArray = super::get_column(batch, "date")?;
+
+                for i in 0..batch.num_rows() {
+                    if !regex.is_match(field_array.value(i)) {
+                        continue;
+                    }
+                    if has_date_filter {
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date_array.value(i)) {
+                            let dt_utc = dt.with_timezone(&chrono::Utc);
+                            if since.is_some_and(|s| dt_utc < s) {
+                                continue;
+                            }
+                            if until.is_some_and(|u| dt_utc > u) {
+                                continue;
+                            }
+                        } else {
+                            bad_dates += 1;
+                            continue;
+                        }
+                    }
+                    message_ids.insert(msg_array.value(i).to_string());
+                }
+            }
+
+            if bad_dates > 0 {
+                tracing::warn!(
+                    "Skipped {} candidates with unparseable dates for field '{}'",
+                    bad_dates,
+                    field_name
+                );
+            }
+
+            tracing::info!(
+                "Regex filter kept {} of {} FTS candidates",
+                message_ids.len(),
+                fts_result_count
+            );
+
+            Ok(message_ids)
+        }
+
+        // Query from field (OR across patterns, then push single set)
+        if let Some(patterns) = from_patterns {
+            if !patterns.is_empty() {
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "from".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!("lore from field returned {} results", field_union.len());
+                field_result_sets.push(field_union);
+            }
+        }
+
+        // Query subject field (OR across patterns)
+        if let Some(patterns) = subject_patterns {
+            if !patterns.is_empty() {
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "subject".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!("lore subject field returned {} results", field_union.len());
+                field_result_sets.push(field_union);
+            }
+        }
+
+        // Query body field (OR across patterns)
+        if let Some(patterns) = body_patterns {
+            if !patterns.is_empty() {
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "body".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!("lore body field returned {} results", field_union.len());
+                field_result_sets.push(field_union);
+            }
+        }
+
+        // Query recipients field (OR across patterns)
+        if let Some(patterns) = recipients_patterns {
+            if !patterns.is_empty() {
+                let mut field_union = HashSet::new();
+                for pattern in patterns {
+                    let results = query_field_impl(
+                        &lore_table,
+                        "recipients".to_string(),
+                        pattern.clone(),
+                        search_limit,
+                        since_dt,
+                        until_dt,
+                    )
+                    .await?;
+                    field_union.extend(results);
+                }
+                tracing::info!(
+                    "lore recipients field returned {} results",
+                    field_union.len()
+                );
+                field_result_sets.push(field_union);
+            }
+        }
+
+        // Compute intersection efficiently
+        if field_result_sets.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        tracing::info!(
+            "lore intersection: {} field result sets with sizes: {:?}",
+            field_result_sets.len(),
+            field_result_sets
+                .iter()
+                .map(|s| s.len())
+                .collect::<Vec<_>>()
+        );
+
+        // Start with the smallest set for faster intersection
+        field_result_sets.sort_by_key(|s| s.len());
+
+        let mut intersection = field_result_sets[0].clone();
+        for set in field_result_sets.iter().skip(1) {
+            // Use retain for in-place intersection (faster than creating new set)
+            intersection.retain(|id| set.contains(id));
+
+            // Early exit if intersection becomes empty
+            if intersection.is_empty() {
+                break;
+            }
+        }
+
+        Ok(intersection)
+    }
+
+    /// Search lore emails with multiple field-pattern conditions
+    /// field_patterns: Vec of (field_name, pattern) tuples
+    /// Patterns for the same field are combined with OR, different fields are combined with AND
+    pub async fn search_lore_emails_multi_field(
+        &self,
+        field_patterns: Vec<(&str, &str)>,
+        limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use std::collections::HashMap;
+
+        if field_patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Group patterns by field
+        let mut field_map: HashMap<&str, Vec<String>> = HashMap::new();
+        for (field, pattern) in field_patterns {
+            field_map
+                .entry(field)
+                .or_default()
+                .push(pattern.to_string());
+        }
+
+        // Extract patterns for each field
+        let from_patterns = field_map.get("from").map(|v| v.as_slice());
+        let subject_patterns = field_map.get("subject").map(|v| v.as_slice());
+        let body_patterns = field_map.get("body").map(|v| v.as_slice());
+        let recipients_patterns = field_map.get("recipients").map(|v| v.as_slice());
+
+        // Use helper to get intersection of message_ids.
+        // Date range is pushed into FTS queries so the candidate set
+        // is already bounded before intersection and fetching.
+        let intersection = self
+            .query_lore_by_fields_intersection(
+                from_patterns,
+                subject_patterns,
+                body_patterns,
+                recipients_patterns,
+                0, // No limit for individual queries
+                since_date,
+                until_date,
+            )
+            .await?;
+
+        tracing::info!("Final intersection has {} message_ids", intersection.len());
+
+        if intersection.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fetch full email records for the intersection.
+        // Date filtering was already pushed into the per-field FTS
+        // queries, so the intersection is already date-bounded.
+        let count_limit = if limit > 0 { limit } else { intersection.len() };
+        let ids: Vec<&String> = intersection.iter().take(count_limit).collect();
+        let final_emails = self.fetch_lore_emails_by_message_ids(&ids).await?;
+
+        tracing::info!(
+            "Fetched {} email records from {} message_ids",
+            final_emails.len(),
+            intersection.len()
+        );
+
+        Ok(final_emails)
+    }
+
+    /// Fetch lore emails by message IDs in batches.
+    ///
+    /// Builds `message_id IN (...)` predicates in chunks to avoid
+    /// per-ID round-trips while keeping predicate size bounded.
+    async fn fetch_lore_emails_by_message_ids(
+        &self,
+        message_ids: &[&String],
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table = self.connection.open_table("lore").execute().await?;
+        let mut emails = Vec::with_capacity(message_ids.len());
+
+        for chunk in message_ids.chunks(500) {
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .map(|id| {
+                    let escaped = id.replace('\'', "''");
+                    format!("'{}'", escaped)
+                })
+                .collect();
+            let predicate = format!("message_id IN ({})", placeholders.join(", "));
+
+            let results = table
+                .query()
+                .only_if(&predicate)
+                .limit(chunk.len())
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            for batch in &results {
+                let git_commit_shas = batch
+                    .column_by_name("git_commit_sha")
+                    .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                    .as_string::<i32>();
+                let from_addrs = batch
+                    .column_by_name("from")
+                    .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                    .as_string::<i32>();
+                let dates = batch
+                    .column_by_name("date")
+                    .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                    .as_string::<i32>();
+                let date_timestamps = batch
+                    .column_by_name("date_timestamp")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+                let msg_ids = batch
+                    .column_by_name("message_id")
+                    .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                    .as_string::<i32>();
+                let in_reply_tos = batch
+                    .column_by_name("in_reply_to")
+                    .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                    .as_string::<i32>();
+                let subjects = batch
+                    .column_by_name("subject")
+                    .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                    .as_string::<i32>();
+                let references_list = batch
+                    .column_by_name("references")
+                    .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                    .as_string::<i32>();
+                let recipients_list = batch
+                    .column_by_name("recipients")
+                    .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                    .as_string::<i32>();
+                let bodies = batch
+                    .column_by_name("body")
+                    .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                    .as_string::<i32>();
+                let symbols_list = batch
+                    .column_by_name("symbols")
+                    .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                    .as_string::<i32>();
+
+                for i in 0..batch.num_rows() {
+                    let symbols_json = symbols_list.value(i);
+                    let symbols: Vec<String> =
+                        serde_json::from_str(symbols_json).unwrap_or_default();
+
+                    emails.push(crate::types::LoreEmailInfo {
+                        git_commit_sha: git_commit_shas.value(i).to_string(),
+                        from: from_addrs.value(i).to_string(),
+                        date: dates.value(i).to_string(),
+                        date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                        message_id: msg_ids.value(i).to_string(),
+                        in_reply_to: if in_reply_tos.is_null(i) {
+                            None
+                        } else {
+                            Some(in_reply_tos.value(i).to_string())
+                        },
+                        subject: subjects.value(i).to_string(),
+                        references: if references_list.is_null(i) {
+                            None
+                        } else {
+                            Some(references_list.value(i).to_string())
+                        },
+                        recipients: recipients_list.value(i).to_string(),
+                        body: bodies.value(i).to_string(),
+                        symbols,
+                    });
+                }
+            }
+        }
+
+        Ok(emails)
+    }
+
+    /// Get a lore email by exact message_id match
+    pub async fn get_lore_email_by_message_id(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        // Add < > around message_id if not already present
+        let normalized_message_id = if message_id.starts_with('<') && message_id.ends_with('>') {
+            message_id.to_string()
+        } else {
+            format!("<{}>", message_id)
+        };
+
+        // Escape SQL string literal
+        let escaped_message_id = normalized_message_id.replace("'", "''");
+        let filter = format!("message_id = '{}'", escaped_message_id);
+
+        let table = self.connection.open_table("lore").execute().await?;
+        let stream = table.query().only_if(&filter).limit(1).execute().await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Extract columns
+            let git_commit_shas = batch
+                .column_by_name("git_commit_sha")
+                .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                .as_string::<i32>();
+            let from_addrs = batch
+                .column_by_name("from")
+                .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                .as_string::<i32>();
+            let dates = batch
+                .column_by_name("date")
+                .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                .as_string::<i32>();
+            let date_timestamps = batch
+                .column_by_name("date_timestamp")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+            let message_ids = batch
+                .column_by_name("message_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                .as_string::<i32>();
+            let in_reply_tos = batch
+                .column_by_name("in_reply_to")
+                .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                .as_string::<i32>();
+            let subjects = batch
+                .column_by_name("subject")
+                .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                .as_string::<i32>();
+            let references_list = batch
+                .column_by_name("references")
+                .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                .as_string::<i32>();
+            let recipients_list = batch
+                .column_by_name("recipients")
+                .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                .as_string::<i32>();
+            let bodies = batch
+                .column_by_name("body")
+                .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                .as_string::<i32>();
+            let symbols_list = batch
+                .column_by_name("symbols")
+                .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                .as_string::<i32>();
+
+            // Parse JSON symbols array
+            let symbols_json = symbols_list.value(0);
+            let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+            // Return the first (and only) result
+            let email = crate::types::LoreEmailInfo {
+                git_commit_sha: git_commit_shas.value(0).to_string(),
+                from: from_addrs.value(0).to_string(),
+                date: dates.value(0).to_string(),
+                date_timestamp: Self::get_date_timestamp(date_timestamps, dates, 0),
+                message_id: message_ids.value(0).to_string(),
+                in_reply_to: if in_reply_tos.is_null(0) {
+                    None
+                } else {
+                    Some(in_reply_tos.value(0).to_string())
+                },
+                subject: subjects.value(0).to_string(),
+                references: if references_list.is_null(0) {
+                    None
+                } else {
+                    Some(references_list.value(0).to_string())
+                },
+                recipients: recipients_list.value(0).to_string(),
+                body: bodies.value(0).to_string(),
+                symbols,
+            };
+
+            return Ok(Some(email));
+        }
+
+        Ok(None)
+    }
+
+    /// Get all emails that reference a message-id (in in_reply_to or references fields)
+    pub async fn get_lore_emails_referencing(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+        use std::collections::HashSet;
+
+        // Escape SQL string literal for pattern matching
+        let escaped_message_id = message_id.replace("\\", "\\\\").replace("'", "''");
+
+        let table = self.connection.open_table("lore").execute().await?;
+
+        // Query 1: Find emails where in_reply_to matches
+        let filter1 = format!("in_reply_to = '{}'", escaped_message_id);
+        let stream1 = table.query().only_if(&filter1).execute().await?;
+        let batches1: Vec<_> = stream1.try_collect().await?;
+
+        // Query 2: Find emails where references contains the message-id
+        let filter2 = format!("regexp_like(`references`, '{}')", escaped_message_id);
+        let stream2 = table.query().only_if(&filter2).execute().await?;
+        let batches2: Vec<_> = stream2.try_collect().await?;
+
+        // Combine batches from both queries
+        let mut batches = batches1;
+        batches.extend(batches2);
+
+        let mut emails = Vec::new();
+        let mut seen_message_ids = HashSet::new();
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Extract columns
+            let git_commit_shas = batch
+                .column_by_name("git_commit_sha")
+                .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                .as_string::<i32>();
+            let from_addrs = batch
+                .column_by_name("from")
+                .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                .as_string::<i32>();
+            let dates = batch
+                .column_by_name("date")
+                .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                .as_string::<i32>();
+            let date_timestamps = batch
+                .column_by_name("date_timestamp")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+            let message_ids = batch
+                .column_by_name("message_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                .as_string::<i32>();
+            let in_reply_tos = batch
+                .column_by_name("in_reply_to")
+                .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                .as_string::<i32>();
+            let subjects = batch
+                .column_by_name("subject")
+                .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                .as_string::<i32>();
+            let references_list = batch
+                .column_by_name("references")
+                .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                .as_string::<i32>();
+            let recipients_list = batch
+                .column_by_name("recipients")
+                .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                .as_string::<i32>();
+            let bodies = batch
+                .column_by_name("body")
+                .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                .as_string::<i32>();
+            let symbols_list = batch
+                .column_by_name("symbols")
+                .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                .as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                let message_id = message_ids.value(i).to_string();
+
+                // Skip if we've already seen this message_id (deduplication)
+                if !seen_message_ids.insert(message_id.clone()) {
+                    continue;
+                }
+
+                // Parse JSON symbols array
+                let symbols_json = symbols_list.value(i);
+                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+                let email = crate::types::LoreEmailInfo {
+                    git_commit_sha: git_commit_shas.value(i).to_string(),
+                    from: from_addrs.value(i).to_string(),
+                    date: dates.value(i).to_string(),
+                    date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                    message_id,
+                    in_reply_to: if in_reply_tos.is_null(i) {
+                        None
+                    } else {
+                        Some(in_reply_tos.value(i).to_string())
+                    },
+                    subject: subjects.value(i).to_string(),
+                    references: if references_list.is_null(i) {
+                        None
+                    } else {
+                        Some(references_list.value(i).to_string())
+                    },
+                    recipients: recipients_list.value(i).to_string(),
+                    body: bodies.value(i).to_string(),
+                    symbols,
+                };
+                emails.push(email);
+            }
+        }
+
+        Ok(emails)
+    }
+
+    /// Search lore emails by exact subject match (case-sensitive substring match)
+    pub async fn search_lore_emails_by_subject(
+        &self,
+        subject: &str,
+        limit: usize,
+        since_date: Option<&str>,
+        until_date: Option<&str>,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        // Parse filter dates to Unix timestamps for database-level filtering
+        let since_timestamp = since_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.timestamp());
+        let until_timestamp = until_date
+            .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+            .map(|dt| dt.timestamp());
+
+        // Escape SQL string literal
+        let escaped_subject = subject.replace("'", "''");
+
+        let table = self.connection.open_table("lore").execute().await?;
+        let has_date_timestamp = table
+            .schema()
+            .await
+            .map(|s| s.field_with_name("date_timestamp").is_ok())
+            .unwrap_or(false);
+
+        // Build WHERE clause with subject filter and optional date filters
+        let mut where_parts = vec![format!("subject LIKE '%{}%'", escaped_subject)];
+
+        if has_date_timestamp {
+            if let Some(since) = since_timestamp {
+                where_parts.push(format!("date_timestamp >= {}", since));
+            }
+            if let Some(until) = until_timestamp {
+                where_parts.push(format!("date_timestamp <= {}", until));
+            }
+        }
+
+        let where_clause = where_parts.join(" AND ");
+        let mut query = table.query().only_if(&where_clause);
+
+        if limit > 0 {
+            query = query.limit(limit);
+        }
+
+        let stream = query.execute().await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        let mut emails = Vec::new();
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Extract columns
+            let git_commit_shas = batch
+                .column_by_name("git_commit_sha")
+                .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                .as_string::<i32>();
+            let from_addrs = batch
+                .column_by_name("from")
+                .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                .as_string::<i32>();
+            let dates = batch
+                .column_by_name("date")
+                .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                .as_string::<i32>();
+            let date_timestamps = batch
+                .column_by_name("date_timestamp")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+            let message_ids = batch
+                .column_by_name("message_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                .as_string::<i32>();
+            let in_reply_tos = batch
+                .column_by_name("in_reply_to")
+                .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                .as_string::<i32>();
+            let subjects = batch
+                .column_by_name("subject")
+                .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                .as_string::<i32>();
+            let references_list = batch
+                .column_by_name("references")
+                .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                .as_string::<i32>();
+            let recipients_list = batch
+                .column_by_name("recipients")
+                .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                .as_string::<i32>();
+            let bodies = batch
+                .column_by_name("body")
+                .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                .as_string::<i32>();
+            let symbols_list = batch
+                .column_by_name("symbols")
+                .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                .as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                // Parse JSON symbols array
+                let symbols_json = symbols_list.value(i);
+                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+                let email = crate::types::LoreEmailInfo {
+                    git_commit_sha: git_commit_shas.value(i).to_string(),
+                    from: from_addrs.value(i).to_string(),
+                    date: dates.value(i).to_string(),
+                    date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                    message_id: message_ids.value(i).to_string(),
+                    in_reply_to: if in_reply_tos.is_null(i) {
+                        None
+                    } else {
+                        Some(in_reply_tos.value(i).to_string())
+                    },
+                    subject: subjects.value(i).to_string(),
+                    references: if references_list.is_null(i) {
+                        None
+                    } else {
+                        Some(references_list.value(i).to_string())
+                    },
+                    recipients: recipients_list.value(i).to_string(),
+                    body: bodies.value(i).to_string(),
+                    symbols,
+                };
+
+                emails.push(email);
+            }
+        }
+
+        Ok(emails)
+    }
+
+    /// Get all lore emails for a specific git commit SHA
+    pub async fn get_lore_emails_by_commit(
+        &self,
+        git_sha: &str,
+    ) -> Result<Vec<crate::types::LoreEmailInfo>> {
+        use arrow::array::AsArray;
+        use futures::TryStreamExt;
+
+        // Escape SQL string literal
+        let escaped_sha = git_sha.replace("'", "''");
+        let filter = format!("git_commit_sha = '{}'", escaped_sha);
+
+        let table = self.connection.open_table("lore").execute().await?;
+        let stream = table.query().only_if(&filter).execute().await?;
+        let batches: Vec<_> = stream.try_collect().await?;
+
+        let mut emails = Vec::new();
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Extract columns
+            let git_commit_shas = batch
+                .column_by_name("git_commit_sha")
+                .ok_or_else(|| anyhow::anyhow!("Missing git_commit_sha column"))?
+                .as_string::<i32>();
+            let from_addrs = batch
+                .column_by_name("from")
+                .ok_or_else(|| anyhow::anyhow!("Missing from column"))?
+                .as_string::<i32>();
+            let dates = batch
+                .column_by_name("date")
+                .ok_or_else(|| anyhow::anyhow!("Missing date column"))?
+                .as_string::<i32>();
+            let date_timestamps = batch
+                .column_by_name("date_timestamp")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>());
+            let message_ids = batch
+                .column_by_name("message_id")
+                .ok_or_else(|| anyhow::anyhow!("Missing message_id column"))?
+                .as_string::<i32>();
+            let in_reply_tos = batch
+                .column_by_name("in_reply_to")
+                .ok_or_else(|| anyhow::anyhow!("Missing in_reply_to column"))?
+                .as_string::<i32>();
+            let subjects = batch
+                .column_by_name("subject")
+                .ok_or_else(|| anyhow::anyhow!("Missing subject column"))?
+                .as_string::<i32>();
+            let references_list = batch
+                .column_by_name("references")
+                .ok_or_else(|| anyhow::anyhow!("Missing references column"))?
+                .as_string::<i32>();
+            let recipients_list = batch
+                .column_by_name("recipients")
+                .ok_or_else(|| anyhow::anyhow!("Missing recipients column"))?
+                .as_string::<i32>();
+            let bodies = batch
+                .column_by_name("body")
+                .ok_or_else(|| anyhow::anyhow!("Missing body column"))?
+                .as_string::<i32>();
+            let symbols_list = batch
+                .column_by_name("symbols")
+                .ok_or_else(|| anyhow::anyhow!("Missing symbols column"))?
+                .as_string::<i32>();
+
+            for i in 0..batch.num_rows() {
+                // Parse JSON symbols array
+                let symbols_json = symbols_list.value(i);
+                let symbols: Vec<String> = serde_json::from_str(symbols_json).unwrap_or_default();
+
+                let email = crate::types::LoreEmailInfo {
+                    git_commit_sha: git_commit_shas.value(i).to_string(),
+                    from: from_addrs.value(i).to_string(),
+                    date: dates.value(i).to_string(),
+                    date_timestamp: Self::get_date_timestamp(date_timestamps, dates, i),
+                    message_id: message_ids.value(i).to_string(),
+                    in_reply_to: if in_reply_tos.is_null(i) {
+                        None
+                    } else {
+                        Some(in_reply_tos.value(i).to_string())
+                    },
+                    subject: subjects.value(i).to_string(),
+                    references: if references_list.is_null(i) {
+                        None
+                    } else {
+                        Some(references_list.value(i).to_string())
+                    },
+                    recipients: recipients_list.value(i).to_string(),
+                    body: bodies.value(i).to_string(),
+                    symbols,
+                };
+                emails.push(email);
+            }
+        }
+
+        Ok(emails)
+    }
+
+    /// Get a single git commit by SHA
+    pub async fn get_git_commit_by_sha(
+        &self,
+        git_sha: &str,
+    ) -> Result<Option<crate::types::GitCommitInfo>> {
+        use futures::TryStreamExt;
+
+        let table = self.connection.open_table("git_commits").execute().await?;
+
+        // Escape SQL string literal
+        let escaped_sha = git_sha.replace("'", "''");
+        let filter = format!("git_sha = '{}'", escaped_sha);
+
+        let results = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        for batch in results {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let git_sha_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let parent_sha_array = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let author_array = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let subject_array = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let message_array = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let tags_array = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let diff_array = batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let symbols_array = batch
+                .column(7)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let files_array = batch
+                .column(8)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            if batch.num_rows() > 0 {
+                let git_sha = git_sha_array.value(0).to_string();
+                let parent_sha: Vec<String> = serde_json::from_str(parent_sha_array.value(0))?;
+                let author = author_array.value(0).to_string();
+                let subject = subject_array.value(0).to_string();
+                let message = message_array.value(0).to_string();
+                let tags = serde_json::from_str(tags_array.value(0))?;
+                let diff = diff_array.value(0).to_string();
+                let symbols: Vec<String> = serde_json::from_str(symbols_array.value(0))?;
+                let files: Vec<String> = serde_json::from_str(files_array.value(0))?;
+
+                return Ok(Some(crate::types::GitCommitInfo {
+                    git_sha,
+                    parent_sha,
+                    author,
+                    subject,
+                    message,
+                    tags,
+                    diff,
+                    symbols,
+                    files,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Get all git commits from the database
+    pub async fn get_all_git_commits(&self) -> Result<Vec<crate::types::GitCommitInfo>> {
+        use futures::TryStreamExt;
+
+        let table = self.connection.open_table("git_commits").execute().await?;
+        let results = table
+            .query()
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut commits = Vec::new();
+
+        for batch in results {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let git_sha_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let parent_sha_array = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let author_array = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let subject_array = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let message_array = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let tags_array = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let diff_array = batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let symbols_array = batch
+                .column(7)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let files_array = batch
+                .column(8)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                let git_sha = git_sha_array.value(i).to_string();
+                let parent_sha: Vec<String> = serde_json::from_str(parent_sha_array.value(i))?;
+                let author = author_array.value(i).to_string();
+                let subject = subject_array.value(i).to_string();
+                let message = message_array.value(i).to_string();
+                let tags = serde_json::from_str(tags_array.value(i))?;
+                let diff = diff_array.value(i).to_string();
+                let symbols: Vec<String> = serde_json::from_str(symbols_array.value(i))?;
+                let files: Vec<String> = serde_json::from_str(files_array.value(i))?;
+
+                commits.push(crate::types::GitCommitInfo {
+                    git_sha,
+                    parent_sha,
+                    author,
+                    subject,
+                    message,
+                    tags,
+                    diff,
+                    symbols,
+                    files,
+                });
+            }
+        }
+
+        Ok(commits)
+    }
+
+    /// Query commits by a chunk of SHAs with post-processing filters
+    /// Regex and symbol filtering are done in Rust code after fetching SHA-filtered results
+    /// This avoids complex SQL operations while still reducing the dataset via SHA filtering
+    pub async fn query_commits_chunk_filtered(
+        &self,
+        sha_chunk: &[String],
+        regex_patterns: &[String],
+        symbol_patterns: &[String],
+    ) -> Result<Vec<crate::types::GitCommitInfo>> {
+        use futures::TryStreamExt;
+
+        if sha_chunk.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table = self.connection.open_table("git_commits").execute().await?;
+
+        // Build SQL WHERE clause with only SHA IN clause
+        // Regex and symbol filtering will be done in Rust post-processing
+        let escaped_shas: Vec<String> = sha_chunk
+            .iter()
+            .map(|sha| format!("'{}'", sha.replace("'", "''")))
+            .collect();
+        let filter = format!("git_sha IN ({})", escaped_shas.join(", "));
+
+        let results = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut commits = Vec::new();
+
+        for batch in results {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let git_sha_array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let parent_sha_array = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let author_array = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let subject_array = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let message_array = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let tags_array = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let diff_array = batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let symbols_array = batch
+                .column(7)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let files_array = batch
+                .column(8)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                let git_sha = git_sha_array.value(i).to_string();
+                let parent_sha: Vec<String> = serde_json::from_str(parent_sha_array.value(i))?;
+                let author = author_array.value(i).to_string();
+                let subject = subject_array.value(i).to_string();
+                let message = message_array.value(i).to_string();
+                let tags = serde_json::from_str(tags_array.value(i))?;
+                let diff = diff_array.value(i).to_string();
+                let symbols: Vec<String> = serde_json::from_str(symbols_array.value(i))?;
+                let files: Vec<String> = serde_json::from_str(files_array.value(i))?;
+
+                commits.push(crate::types::GitCommitInfo {
+                    git_sha,
+                    parent_sha,
+                    author,
+                    subject,
+                    message,
+                    tags,
+                    diff,
+                    symbols,
+                    files,
+                });
+            }
+        }
+
+        // Apply regex filtering in Rust code (post-processing)
+        if !regex_patterns.is_empty() {
+            // Compile regex patterns
+            let mut regexes = Vec::new();
+            for pattern in regex_patterns {
+                match regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                {
+                    Ok(re) => regexes.push(re),
+                    Err(e) => {
+                        tracing::warn!("Invalid regex pattern '{}': {}", pattern, e);
+                        continue;
+                    }
+                }
+            }
+
+            // Filter commits: ALL regex patterns must match (in message OR diff)
+            commits.retain(|commit| {
+                regexes
+                    .iter()
+                    .all(|re| re.is_match(&commit.message) || re.is_match(&commit.diff))
+            });
+        }
+
+        // Apply symbol filtering in Rust code (post-processing)
+        if !symbol_patterns.is_empty() {
+            // Compile symbol regex patterns
+            let mut symbol_regexes = Vec::new();
+            for pattern in symbol_patterns {
+                match regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                {
+                    Ok(re) => symbol_regexes.push(re),
+                    Err(e) => {
+                        tracing::warn!("Invalid symbol regex pattern '{}': {}", pattern, e);
+                        continue;
+                    }
+                }
+            }
+
+            // Filter commits: ALL symbol patterns must match
+            commits.retain(|commit| {
+                symbol_regexes
+                    .iter()
+                    .all(|re| commit.symbols.iter().any(|symbol| re.is_match(symbol)))
+            });
+        }
+
+        Ok(commits)
+    }
+
+    /// Return the set of commit SHAs already recorded in the
+    /// lore_indexed_commits table. The table contains only short
+    /// SHA strings, so reading it entirely into memory is cheap.
+    pub async fn get_indexed_lore_commits(&self) -> Result<HashSet<String>> {
+        let table = match self
+            .connection
+            .open_table("lore_indexed_commits")
+            .execute()
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to open lore_indexed_commits table: {}", e);
+                return Ok(HashSet::new());
+            }
+        };
+
+        let stream = table
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "git_commit_sha".to_string()
+            ]))
+            .execute()
+            .await?;
+
+        let batches: Vec<_> = stream.try_collect().await?;
+        let mut existing = HashSet::new();
+        for batch in batches {
+            if let Some(column) = batch.column_by_name("git_commit_sha") {
+                if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
+                    existing.reserve(string_array.len());
+                    for i in 0..string_array.len() {
+                        existing.insert(string_array.value(i).to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(existing)
+    }
+
+    /// Record git commit SHAs that have been processed for lore indexing.
+    pub async fn insert_lore_indexed_commits(&self, commit_shas: &[String]) -> Result<()> {
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        if commit_shas.is_empty() {
+            return Ok(());
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "git_commit_sha",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from(commit_shas.to_vec()))];
+
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+        let batches = vec![Ok(batch)];
+        let batch_iterator =
+            arrow::record_batch::RecordBatchIterator::new(batches.into_iter(), schema);
+
+        let table = self
+            .connection
+            .open_table("lore_indexed_commits")
+            .execute()
+            .await?;
+        let mut merge_insert = table.merge_insert(&["git_commit_sha"]);
+        merge_insert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge_insert.execute(Box::new(batch_iterator)).await?;
+
+        Ok(())
+    }
+}

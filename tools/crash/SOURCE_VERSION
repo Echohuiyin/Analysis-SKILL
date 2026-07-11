@@ -1,0 +1,4 @@
+repo: https://github.com/crash-utility/crash.git
+ref: 9.0.2
+commit: 61fe107
+source: official crash-utility release tag

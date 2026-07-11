@@ -1,6 +1,6 @@
 #!/bin/bash
 # build_crash.sh - Build crash utility from source
-# Usage: ./build_crash.sh [--arch x86_64|arm64] [--clean]
+# Usage: ./build_crash.sh [--arch x86_64|arm64] [--clean] [--source-dir <path>] [--output <path>] [--repo-url <url>] [--repo-ref <ref>]
 
 set -e
 
@@ -11,6 +11,11 @@ BIN_DIR="${TOOL_DIR}/bin"
 ARCH="x86_64"
 CLEAN=false
 JOBS=$(nproc)
+SOURCE_DIR=""
+OUTPUT_PATH=""
+REPO_URL="https://github.com/crash-utility/crash.git"
+REPO_REF=""
+CUSTOM_SOURCE_DIR=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -27,6 +32,31 @@ while [[ $# -gt 0 ]]; do
             JOBS="$2"
             shift 2
         ;;
+        --source-dir)
+            SOURCE_DIR="$2"
+            CUSTOM_SOURCE_DIR=true
+            shift 2
+        ;;
+        --output)
+            OUTPUT_PATH="$2"
+            shift 2
+        ;;
+        --repo-url)
+            REPO_URL="$2"
+            shift 2
+        ;;
+        --repo-ref)
+            REPO_REF="$2"
+            shift 2
+        ;;
+        --help)
+            echo "Usage: ./build_crash.sh [--arch x86_64|arm64] [--clean] [--jobs N] [--source-dir <path>] [--output <path>] [--repo-url <url>] [--repo-ref <ref>]"
+            echo ""
+            echo "Defaults preserve crash-vmcore standalone behavior:"
+            echo "  source-dir: ${TOOL_DIR}/crash-source"
+            echo "  output:     ${BIN_DIR}/crash"
+            exit 0
+        ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -34,11 +64,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ -z "$SOURCE_DIR" ]; then
+    SOURCE_DIR="${TOOL_DIR}/crash-source"
+fi
+if [ -z "$OUTPUT_PATH" ]; then
+    OUTPUT_PATH="${BIN_DIR}/crash"
+fi
+SOURCE_DIR="$(mkdir -p "$(dirname "$SOURCE_DIR")" && cd "$(dirname "$SOURCE_DIR")" && pwd)/$(basename "$SOURCE_DIR")"
+OUTPUT_PATH="$(mkdir -p "$(dirname "$OUTPUT_PATH")" && cd "$(dirname "$OUTPUT_PATH")" && pwd)/$(basename "$OUTPUT_PATH")"
+
 echo "=== Building Crash Utility ==="
 echo "Architecture: $ARCH"
 echo "Jobs: $JOBS"
 echo "Clean: $CLEAN"
-echo "Output: $BIN_DIR"
+echo "Source: $SOURCE_DIR"
+echo "Output: $OUTPUT_PATH"
+echo "Repo: $REPO_URL"
+echo "Repo ref: ${REPO_REF:-default}"
 echo
 
 # Check dependencies
@@ -53,29 +95,38 @@ done
 echo "✓ Dependencies OK"
 
 # Clone source
-CRASH_SRC="${TOOL_DIR}/crash-source"
+CRASH_SRC="$SOURCE_DIR"
 echo
 echo "[2/5] Getting crash source..."
 
 if [ -d "$CRASH_SRC" ]; then
     if [ "$CLEAN" = true ]; then
-        echo "Cleaning existing source..."
-        rm -rf "$CRASH_SRC"
+        if [ "$CUSTOM_SOURCE_DIR" = true ]; then
+            echo "Cleaning existing build artifacts..."
+            (
+                cd "$CRASH_SRC"
+                make clean 2>/dev/null || true
+                find . -maxdepth 1 -type d -name 'gdb-*' -exec rm -rf {} + 2>/dev/null || true
+            )
+        else
+            echo "Cleaning existing source..."
+            rm -rf "$CRASH_SRC"
+        fi
     else
         echo "Using existing source: $CRASH_SRC"
-        cd "$CRASH_SRC"
-        git pull || true
+        if [ -d "$CRASH_SRC/.git" ]; then
+            cd "$CRASH_SRC"
+            git pull || true
+        fi
     fi
 fi
 
-if [ ! -d "$CRASH_SRC" ]; then
+if [ ! -f "$CRASH_SRC/Makefile" ]; then
     echo "Cloning crash repository..."
-    # Try SSH first (faster)
-    if git clone git@github.com:crash-utility/crash.git "$CRASH_SRC" 2>/dev/null; then
-        echo "✓ Cloned via SSH"
-    else
-        echo "SSH failed, using HTTPS..."
-        git clone https://github.com/crash-utility/crash.git "$CRASH_SRC"
+    rm -rf "$CRASH_SRC"
+    git clone "$REPO_URL" "$CRASH_SRC"
+    if [ -n "$REPO_REF" ]; then
+        (cd "$CRASH_SRC" && git checkout "$REPO_REF")
     fi
 fi
 
@@ -88,15 +139,15 @@ echo "This may take 3-5 minutes for initial GDB compilation..."
 
 if [ "$CLEAN" = true ]; then
     make clean 2>/dev/null || true
-    rm -rf gdb-* 2>/dev/null || true
+    find . -maxdepth 1 -type d -name 'gdb-*' -exec rm -rf {} + 2>/dev/null || true
 fi
 
 START=$(date +%s)
 
 if [ "$ARCH" = "x86_64" ]; then
-    make -j$JOBS
+    make target=X86_64 -j$JOBS
 elif [ "$ARCH" = "arm64" ]; then
-    make CROSS_COMPILE=aarch64-linux-gnu- -j$JOBS
+    make target=ARM64 -j$JOBS
 else
     echo "ERROR: Unsupported architecture: $ARCH"
     exit 1
@@ -116,8 +167,8 @@ if [ ! -f "crash" ]; then
     exit 1
 fi
 
-CRASH_VERSION=$(./crash --version 2>&1 | head -1)
-GDB_VERSION=$(./crash --version 2>&1 | grep "GNU gdb" | awk '{print $4}')
+CRASH_VERSION=$(./crash -v 2>&1 | head -1)
+GDB_VERSION=$(./crash -v 2>&1 | grep "GNU gdb" | awk '{print $4}')
 
 echo "Version: $CRASH_VERSION"
 echo "GDB: $GDB_VERSION"
@@ -134,23 +185,20 @@ fi
 echo
 echo "[5/5] Installing..."
 
-mkdir -p "$BIN_DIR"
-cp crash "$BIN_DIR/crash"
-chmod +x "$BIN_DIR/crash"
+mkdir -p "$(dirname "$OUTPUT_PATH")"
+cp crash "$OUTPUT_PATH"
+chmod +x "$OUTPUT_PATH"
 
-echo "✓ Installed to: $BIN_DIR/crash"
+echo "✓ Installed to: $OUTPUT_PATH"
 
 # Summary
 echo
 echo "=== Build Summary ==="
 echo "Source: $CRASH_SRC"
-echo "Binary: $BIN_DIR/crash"
+echo "Binary: $OUTPUT_PATH"
 echo "Version: $CRASH_VERSION"
 echo "GDB: $GDB_VERSION"
 echo "Build Time: ${BUILD_TIME}s"
 echo
 echo "To use:"
-echo "  $BIN_DIR/crash vmlinux vmcore.elf"
-echo
-echo "To configure for Analysis-SKILL:"
-echo "  echo 'CRASH_BINARY=$BIN_DIR/crash' >> .env"
+echo "  $OUTPUT_PATH vmlinux vmcore.elf"

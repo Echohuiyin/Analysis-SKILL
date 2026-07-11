@@ -29,11 +29,10 @@ outputs/
 test_modules/
 test.sh
 init
-bin/
+/bin/
 
 # Prebuilt binaries
 tools/busybox/prebuilt/
-tools/crash/
 
 # IDE
 .idea/
