@@ -73,7 +73,17 @@ If kernel image exists, use it directly. If not:
 
 **DO NOT attempt kernel compilation in this skill.**
 
-### Step 2: Create Minimal Initramfs
+### Step 2: Create Guest Root Filesystem
+
+Default path: create an ext4 rootfs image with `scripts/create_ext4_rootfs.sh`.
+It uses the architecture-matched BusyBox from `tools/busybox/prebuilt/` and
+packs `/init`, optional test script, modules, and userspace binaries into the
+image without requiring sudo or loop mounts.
+
+Use the older initramfs path only for compatibility or when an initrd-specific
+test is required.
+
+### BusyBox Architecture Matching
 
 **CRITICAL: Busybox Architecture Matching**
 

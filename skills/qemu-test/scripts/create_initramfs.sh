@@ -62,7 +62,8 @@ find_busybox() {
                 # (e.g. /tmp/busybox_build_x86_64 left over from a failed
                 # build) passes the arch check but reports "applet not
                 # found" for every command, breaking initramfs shells.
-                # `--list` returns ≥1 applet on a healthy busybox.
+                # `sh -c true` proves the shell applet works even when the
+                # binary is named busybox_<arch> instead of plain busybox.
                 #
                 # Skip the runtime check when target_arch != host_arch —
                 # we can't execute the cross-arch binary on this host, so
@@ -79,7 +80,7 @@ find_busybox() {
                 fi
 
                 if [ "$need_runtime_check" = "1" ]; then
-                    if ! "$busybox" --list >/dev/null 2>&1; then
+                    if ! "$busybox" sh -c true >/dev/null 2>&1; then
                         echo "⚠️  Busybox at $busybox fails applet health check (likely a stub), skipping" >&2
                         continue
                     fi
