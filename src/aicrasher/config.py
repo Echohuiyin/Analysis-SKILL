@@ -170,7 +170,7 @@ class AppConfig(BaseModel):
         description="Path to the crash CLI utility (auto-detected, prefers 9.0.2+ for QEMU vmcore).",
     )
     crash_timeout_seconds: int = Field(
-        default_factory=lambda: _get_int("CRASH_TIMEOUT_SECONDS", 300),
+        default_factory=lambda: _get_int("CRASH_TIMEOUT_SECONDS", 600),
         description="Maximum time to wait for a crash command.",
     )
     crash_output_max_chars: int = Field(
