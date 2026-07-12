@@ -118,6 +118,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 if ! command -v mke2fs >/dev/null 2>&1; then
+    # mke2fs is in /usr/sbin or /sbin, not in normal user PATH
+    for candidate in /usr/sbin/mke2fs /sbin/mke2fs /usr/local/sbin/mke2fs; do
+        if [ -x "$candidate" ]; then
+            export PATH="/usr/sbin:/sbin:/usr/local/sbin:$PATH"
+            break
+        fi
+    done
+fi
+
+if ! command -v mke2fs >/dev/null 2>&1; then
     echo "ERROR: mke2fs not found (install: e2fsprogs)"
     exit 1
 fi
